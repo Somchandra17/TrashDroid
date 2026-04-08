@@ -27,20 +27,25 @@ class ADB:
             return ["adb", "-s", self.device_id]
         return ["adb"]
 
-    def run(self, args: list[str], timeout: int = 60, check: bool = False) -> subprocess.CompletedProcess:
+    def run(self, args: list[str], timeout: int = 60, check: bool = False, retries: int = 2) -> subprocess.CompletedProcess:
         cmd = self._base_cmd() + args
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            if check and result.returncode != 0:
-                raise ADBError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
-            return result
-        except subprocess.TimeoutExpired:
-            raise ADBError(f"Command timed out ({timeout}s): {' '.join(cmd)}")
+        
+        for attempt in range(1 + retries):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                if check and result.returncode != 0:
+                    raise ADBError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
+                return result
+            except (subprocess.TimeoutExpired, ADBError) as e:
+                if attempt < retries:
+                    time.sleep(attempt + 1)
+                    continue
+                raise ADBError(f"Command failed after {retries + 1} attempts: {' '.join(cmd)}") from e
 
     def shell(self, cmd: str, root: bool = False, timeout: int = 60) -> subprocess.CompletedProcess:
         if root:
@@ -104,6 +109,10 @@ class ADB:
                 continue
         return None
 
+    def is_package_installed(self, package: str) -> bool:
+        result = self.shell(f"pm list packages {package}")
+        return f"package:{package}" in result.stdout
+
     def get_pid(self, package: str) -> Optional[str]:
         result = self.shell(f"pidof {package}")
         pid = result.stdout.strip()
@@ -157,7 +166,19 @@ class ADB:
         return result.stdout.strip()
 
     def screencap(self, output_path: str) -> bool:
-        """Capture a screenshot from the device and save it locally."""
+        """Capture a screenshot from the device and save it locally.
+        Uses 'adb exec-out' for reliable binary transfer (no PTY corruption)."""
+        cmd = self._base_cmd() + ["exec-out", "screencap", "-p"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if result.returncode == 0 and len(result.stdout) > 100:
+                from pathlib import Path
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(output_path).write_bytes(result.stdout)
+                return True
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        # Fallback to old method if exec-out fails
         remote_path = "/sdcard/dast_screenshot_tmp.png"
         self.shell(f"screencap -p {remote_path}")
         result = self.run(["pull", remote_path, output_path], timeout=30)

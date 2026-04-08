@@ -12,6 +12,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
+import signal
 import sys
 import time
 import traceback
@@ -94,10 +96,16 @@ def parse_args() -> argparse.Namespace:
         help="Non-interactive mode — uses sensible defaults for all prompts",
     )
     parser.add_argument(
-        "--report-mode",
+        "--report",
         choices=["client", "internal"],
         default="client",
-        help="Report style: client hides AI prompt, internal includes it",
+        help="Report detail level (internal includes prompts)",
+    )
+    parser.add_argument(
+        "--screenshot-delay",
+        type=float,
+        default=4.5,
+        help="Delay in seconds before capturing a screenshot (default: 4.5)",
     )
     return parser.parse_args()
 
@@ -150,6 +158,11 @@ def main() -> int:
     else:
         console.print("[yellow]⚠ Device does not appear to be rooted. Some tests may fail.[/yellow]")
 
+    # Check on-device prerequisites
+    from phases.preflight import verify_device_prerequisites
+    if not verify_device_prerequisites(adb):
+        return 1
+
     # ── APK input ──
     if args.package:
         config.package_name = args.package
@@ -169,7 +182,8 @@ def main() -> int:
         return 1
 
     config.auto_mode = args.auto
-    config.report_mode = args.report_mode
+    config.report_mode = args.report
+    config.screenshot_delay = args.screenshot_delay
     config.init_output()
 
     # ── Install & prepare ──
@@ -177,7 +191,35 @@ def main() -> int:
 
     # ── Init helpers ──
     drozer = Drozer(device_id)
-    screenshotter = ScreenshotManager(adb, config.screenshot_dir)
+    screenshotter = ScreenshotManager(adb, config.screenshot_dir, config)
+
+    # ── Register cleanup handler (prevents orphan scrcpy + saves partial report) ──
+    _cleanup_state = {"screenshotter": screenshotter, "config": config, "device_info": device_info}
+
+    def _cleanup():
+        ss = _cleanup_state.get("screenshotter")
+        if ss:
+            ss.stop_scrcpy()
+        cfg = _cleanup_state.get("config")
+        dinfo = _cleanup_state.get("device_info")
+        if cfg and dinfo and any(cfg.findings.values()):
+            try:
+                from core.report import ReportGenerator
+                reporter = ReportGenerator(cfg, dinfo)
+                path = reporter.generate()
+                print(f"\n[Cleanup] Partial report saved to: {path}")
+            except Exception:
+                pass
+
+    atexit.register(_cleanup)
+
+    def _signal_handler(signum, frame):
+        console.print(f"\n[yellow]Received signal {signum} — cleaning up...[/yellow]")
+        _cleanup()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     # Determine which phases to run
     if args.phases:
@@ -211,6 +253,13 @@ def main() -> int:
             want_scrcpy = Confirm.ask("Launch scrcpy for live screen mirroring?", default=True)
             if want_scrcpy:
                 screenshotter.start_scrcpy()
+
+    # ── Start background logcat collector ──
+    from utils.logcat_collector import BackgroundLogcatCollector
+    bg_logcat = BackgroundLogcatCollector(device_id, config.package_name, config.output_dir)
+    bg_logcat.start()
+    console.print("[dim]Background logcat collector started.[/dim]")
+    _cleanup_state["bg_logcat"] = bg_logcat
 
     # ── Execute phases ──
     phase_runners = {
@@ -247,6 +296,14 @@ def main() -> int:
             )
             if not args.auto and not Confirm.ask("Continue to next phase?", default=True):
                 break
+
+    # ── Stop background logcat collector and integrate findings ──
+    bg_logcat.stop()
+    bg_findings = bg_logcat.save_and_scan()
+    for bf in bg_findings:
+        config.add_finding("Background Logcat", bf["title"], bf["severity"], bf["detail"])
+    if bg_findings:
+        console.print(f"[yellow]Background logcat found {len(bg_findings)} finding(s).[/yellow]")
 
     # ── Stop scrcpy ──
     screenshotter.stop_scrcpy()

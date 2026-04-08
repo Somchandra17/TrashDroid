@@ -3,6 +3,7 @@ Markdown report generator: compiles all phase findings into a single .md report.
 """
 
 from __future__ import annotations
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,31 @@ CVSS_BY_SEVERITY = {
     "Low": ("3.1", "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N"),
     "Info": ("0.0", "N/A"),
 }
+
+
+def _contextual_cvss(severity: str, title: str, detail: str) -> tuple[str, str]:
+    """Derive context-aware CVSS vector based on finding type, not just severity."""
+    text = f"{title}\n{detail}".lower()
+    base_score, base_vector = CVSS_BY_SEVERITY.get(severity, ("0.0", "N/A"))
+
+    if severity == "Info" or base_vector == "N/A":
+        return base_score, base_vector
+
+    # Adjust Attack Vector based on finding context
+    if any(kw in text for kw in ["backup", "usb", "physical"]):
+        # Physical access required
+        return base_score, base_vector.replace("AV:N", "AV:P")
+    if any(kw in text for kw in ["exported", "component", "activity accessible", "post-logout", "intent"]):
+        # Local attack — requires app on same device
+        return base_score, base_vector.replace("AV:N", "AV:L")
+    if any(kw in text for kw in ["cleartext", "http://", "network", "mitm"]):
+        # Network-based attack
+        return base_score, base_vector  # Already AV:N
+    if any(kw in text for kw in ["sql injection", "path traversal", "content provider"]):
+        # Network if exposed via deep link, otherwise local
+        return base_score, base_vector.replace("AV:N", "AV:L")
+
+    return base_score, base_vector
 
 
 def _dedupe_findings(config: Config) -> dict[str, list[dict]]:
@@ -306,6 +332,8 @@ class ReportGenerator:
         sections.append(f"**Device ID:** `{c.device_id}`  ")
         if c.apk_path:
             sections.append(f"**APK:** `{c.apk_path}`  ")
+        if getattr(c, "apk_hash", None):
+            sections.append(f"**APK SHA-256:** `{c.apk_hash}`  ")
         sections.append(f"**Pre-installed:** {'Yes' if c.is_preinstalled else 'No'}  ")
         sections.append(f"**Tested logged in:** {'Yes' if c.logged_in else 'No'}\n")
 
@@ -358,7 +386,7 @@ class ReportGenerator:
             else:
                 for i, f in enumerate(phase_findings, 1):
                     normalized_detail = _normalize_detail(phase_name, f, c.commands_log)
-                    cvss_score, cvss_vector = CVSS_BY_SEVERITY.get(f["severity"], ("0.0", "N/A"))
+                    cvss_score, cvss_vector = _contextual_cvss(f["severity"], f["title"], normalized_detail)
                     confidence = _confidence_for_finding(f["title"], normalized_detail)
                     remediation = _remediation_for_finding(f["title"], normalized_detail)
                     impact = _business_impact_for_finding(f["title"], normalized_detail)
@@ -377,8 +405,9 @@ class ReportGenerator:
                     sections.append(f"- **Remediation:** {remediation}")
                     sections.append(f"- **Detail:**\n")
                     detail_text = normalized_detail
-                    if len(detail_text) > 3000:
-                        detail_text = detail_text[:3000] + "\n\n[... truncated ...]"
+                    total_len = len(detail_text)
+                    if total_len > 3000:
+                        detail_text = detail_text[:3000] + f"\n\n[... truncated — {total_len - 3000} more characters omitted ...]"
                     sections.append(f"```\n{detail_text}\n```\n")
                     if f["severity"] in {"High", "Critical"}:
                         sections.append("- **Jira Draft:**")
@@ -459,4 +488,40 @@ class ReportGenerator:
             report_path.write_text(full_report, encoding="utf-8")
         except OSError as e:
             raise RuntimeError(f"Failed to write report to {report_path}: {e}") from e
+
+        # ── JSON findings export ──
+        json_findings = []
+        for phase_name, phase_findings in deduped_findings.items():
+            for f in phase_findings:
+                normalized_detail = _normalize_detail(phase_name, f, c.commands_log)
+                cvss_score, cvss_vector = _contextual_cvss(f["severity"], f["title"], normalized_detail)
+                json_findings.append({
+                    "phase": phase_name,
+                    "title": f["title"],
+                    "severity": f["severity"],
+                    "status": f["status"],
+                    "cvss_score": cvss_score,
+                    "cvss_vector": cvss_vector,
+                    "confidence": _confidence_for_finding(f["title"], normalized_detail),
+                    "remediation": _remediation_for_finding(f["title"], normalized_detail),
+                    "business_impact": _business_impact_for_finding(f["title"], normalized_detail),
+                    "occurrences": f.get("occurrences", 1),
+                    "detail": normalized_detail[:5000],
+                })
+
+        json_export = {
+            "package": c.package_name,
+            "device_id": c.device_id,
+            "apk_hash": getattr(c, "apk_hash", None),
+            "timestamp": now,
+            "total_findings": len(json_findings),
+            "severity_counts": severity_counts,
+            "findings": json_findings,
+        }
+        json_path = c.output_dir / f"findings_{c.package_name}_{c.timestamp}.json"
+        try:
+            json_path.write_text(json.dumps(json_export, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
         return str(report_path)

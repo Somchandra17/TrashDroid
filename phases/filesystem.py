@@ -16,6 +16,7 @@ from rich.prompt import Confirm
 
 from core.config import Config, SENSITIVE_PATTERNS
 from core.adb import ADB
+from utils.helpers import grep_sensitive_lines
 
 console = Console()
 PHASE = "Phase III — Local File System Analysis"
@@ -61,9 +62,15 @@ def run_filesystem_analysis(config: Config, adb: ADB) -> None:
                 console.print(f"    [green]Pulled {file_count} file(s)[/green]")
             else:
                 console.print(f"    [yellow]Directory empty or inaccessible[/yellow]")
+                # On-device grep fallback for inaccessible directories
+                if rooted:
+                    _on_device_grep_fallback(config, adb, remote)
         except Exception as e:
             console.print(f"    [yellow]Could not pull {remote}: {e}[/yellow]")
             config.log_command(PHASE, f"adb pull {remote} {local}", "", str(e))
+            # On-device grep fallback when pull fails entirely
+            if rooted:
+                _on_device_grep_fallback(config, adb, remote)
 
     for remote, local in non_root_targets:
         console.print(f"  [cyan]Pulling:[/cyan] {remote}")
@@ -75,16 +82,7 @@ def run_filesystem_analysis(config: Config, adb: ADB) -> None:
             console.print(f"    [yellow]Could not pull {remote}: {e}[/yellow]")
             config.log_command(PHASE, f"adb pull {remote} {local}", "", str(e))
 
-    # ── Also pull entire data dir for completeness ──
-    console.print(f"  [cyan]Pulling full data directory (root)...[/cyan]")
-    try:
-        if rooted:
-            full_pull = adb.pull_as_root(f"{device_base}/", str(local_base / "full_data"))
-        else:
-            full_pull = adb.pull(f"{device_base}/", str(local_base / "full_data"))
-        config.log_command(PHASE, f"adb pull {device_base}/ {local_base}/full_data", full_pull)
-    except Exception:
-        pass
+    # NOTE: Full data dir pull removed (was redundant with individual subdirectory pulls above).
 
     # ── Grep scan for sensitive data ──
     console.print("\n[cyan]Scanning pulled files for sensitive data...[/cyan]")
@@ -119,6 +117,9 @@ def run_filesystem_analysis(config: Config, adb: ADB) -> None:
     # ── File permission analysis ──
     _check_file_permissions(config, adb, pkg)
 
+    # ── Keystore analysis ──
+    _analyze_keystores(config, str(local_base))
+
     console.print(f"\n[green]✓ {PHASE} complete.[/green]")
 
 
@@ -135,6 +136,32 @@ def _grep_sensitive(directory: str) -> str:
         return ""
 
 
+def _on_device_grep_fallback(config: Config, adb: ADB, remote_path: str) -> None:
+    """Run grep directly on the device when local pull is not possible."""
+    console.print(f"    [cyan]Running on-device grep fallback for {remote_path}...[/cyan]")
+    try:
+        result = adb.shell(
+            f"grep -rniE '{SENSITIVE_PATTERNS}' {remote_path} 2>/dev/null",
+            root=True,
+            timeout=30,
+        )
+        output = result.stdout.strip()
+        config.log_command(PHASE, f"on-device grep {remote_path}", output[:5000])
+        if output:
+            lines = output.splitlines()
+            config.add_finding(
+                PHASE,
+                f"Sensitive data found on-device (grep fallback): {remote_path}",
+                "High",
+                f"Could not pull files locally, but on-device grep found {len(lines)} match(es):\n\n{output[:5000]}",
+            )
+            console.print(f"    [red]On-device grep found {len(lines)} sensitive match(es)[/red]")
+        else:
+            console.print(f"    [green]On-device grep: no sensitive data[/green]")
+    except Exception as e:
+        console.print(f"    [yellow]On-device grep failed: {e}[/yellow]")
+
+
 def _analyze_databases(config: Config, base_dir: str) -> None:
     console.print("\n[cyan]Analyzing SQLite databases...[/cyan]")
     db_dir = Path(base_dir) / "databases"
@@ -142,12 +169,16 @@ def _analyze_databases(config: Config, base_dir: str) -> None:
         console.print("  [yellow]No databases directory found.[/yellow]")
         return
 
-    db_files = list(db_dir.glob("*.db")) + list(db_dir.glob("*.sqlite")) + list(db_dir.glob("*.sqlite3"))
-    # Also check for journal-less databases
-    for f in db_dir.iterdir():
-        if f.is_file() and f.suffix not in [".journal", ".wal", ".shm", "-journal", "-wal", "-shm"]:
-            if f not in db_files:
-                db_files.append(f)
+    # 4.3 Detect SQLite databases by magic header
+    db_files = []
+    for f in db_dir.rglob("*"):
+        if f.is_file():
+            try:
+                with open(f, "rb") as fd:
+                    if fd.read(16) == b"SQLite format 3\x00":
+                        db_files.append(f)
+            except OSError:
+                pass
 
     if not db_files:
         console.print("  [yellow]No database files found.[/yellow]")
@@ -185,7 +216,7 @@ def _analyze_databases(config: Config, base_dir: str) -> None:
             dump_path.parent.mkdir(parents=True, exist_ok=True)
             dump_path.write_text(dump_result.stdout, encoding="utf-8")
 
-            sensitive_in_db = _grep_string(dump_result.stdout)
+            sensitive_in_db = grep_sensitive_lines(dump_result.stdout)
             if sensitive_in_db:
                 config.add_finding(
                     PHASE,
@@ -219,7 +250,7 @@ def _analyze_shared_prefs(config: Config, prefs_dir: str) -> None:
             content = xml_file.read_text(encoding="utf-8", errors="replace")
             config.log_command(PHASE, f"cat shared_prefs/{xml_file.name}", content[:2000])
 
-            sensitive = _grep_string(content)
+            sensitive = grep_sensitive_lines(content)
             if sensitive:
                 config.add_finding(
                     PHASE,
@@ -258,7 +289,7 @@ def _analyze_nosql(config: Config, adb: ADB, pkg: str, base_dir: str) -> None:
                 ["strings", str(f)],
                 capture_output=True, text=True, timeout=30,
             )
-            sensitive = _grep_string(result.stdout)
+            sensitive = grep_sensitive_lines(result.stdout)
             if sensitive:
                 config.add_finding(
                     PHASE,
@@ -300,11 +331,24 @@ def _check_file_permissions(config: Config, adb: ADB, pkg: str) -> None:
         config.log_command(PHASE, f"find /data/data/{pkg} -type f -perm -o=w", result.stdout)
 
 
-def _grep_string(text: str) -> str:
-    """Run a case-insensitive regex search over a string for sensitive patterns."""
-    import re
-    matches = []
-    for line in text.splitlines():
-        if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE):
-            matches.append(line.strip())
-    return "\n".join(matches[:200])
+def _analyze_keystores(config: Config, base_dir: str) -> None:
+    console.print("\n[cyan]Checking for Keystore files...[/cyan]")
+    base = Path(base_dir)
+    keystores = []
+    for ext in ["*.jks", "*.bks", "*.keystore"]:
+        keystores.extend(base.rglob(ext))
+    
+    if keystores:
+        paths = "\n".join(str(k) for k in keystores)
+        config.add_finding(
+            PHASE,
+            "Android Keystore files found in app data",
+            "High",
+            f"The following keystore files were found in local storage:\n{paths}",
+        )
+        console.print(f"  [red]Found {len(keystores)} Keystore file(s)[/red]")
+    else:
+        console.print("  [green]No Keystore files found.[/green]")
+
+
+# _grep_string removed — use utils.helpers.grep_sensitive_lines instead

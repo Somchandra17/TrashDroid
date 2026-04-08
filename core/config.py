@@ -39,6 +39,22 @@ MANIFEST_SECURITY_FLAGS = {
         "risk": "Medium",
         "desc": "App allows HTTP (cleartext) traffic — susceptible to MitM attacks.",
     },
+    'android:fullBackupContent="true"': {
+        "risk": "Medium",
+        "desc": "Explicitly allows customized full backup extraction.",
+    },
+    'android:backupAgent': {
+        "risk": "Low",
+        "desc": "Custom backup agent heavily utilized, verify logic for sensitive data.",
+    },
+    'android:directBootAware="true"': {
+        "risk": "Info",
+        "desc": "Component can run before device is unlocked; credentials may be exposed.",
+    },
+    'android:networkSecurityConfig': {
+        "risk": "Info",
+        "desc": "Custom network security config is present; review for weak TrustManagers or cleartext.",
+    },
 }
 
 REQUIRED_TOOLS = ["adb", "drozer", "scrcpy", "apktool"]
@@ -64,12 +80,35 @@ BANNER = _load_banner()
 
 
 @dataclass
+class Timing:
+    adb_run_timeout: int = 60
+    logcat_auto_timeout: int = 45
+    screenshot_settle_delay: float = 4.5
+    db_query_timeout: int = 120
+    polling_retries: int = 3
+    file_pull_timeout: int = 300
+
+
+@dataclass
+class Limits:
+    max_dump_mb: int = 32
+    binary_file_scan_limit: int = 50 * 1024 * 1024
+    max_binary_files: int = 500
+    max_logcat_lines: int = 50000
+
+
+TIMING = Timing()
+LIMITS = Limits()
+
+
+@dataclass
 class Config:
     """Mutable state shared across all phases."""
 
     device_id: str = ""
     package_name: str = ""
     apk_path: Optional[str] = None
+    apk_hash: Optional[str] = None
     is_preinstalled: bool = False
     logged_in: bool = False
     output_dir: Path = Path(".")
@@ -79,7 +118,9 @@ class Config:
     auto_mode: bool = False
     report_mode: str = "client"  # client | internal
 
-    # Accumulated findings per phase (phase_name -> list of finding dicts)
+    screenshot_delay: float = 4.5
+
+    # accumulated findings per phase (phase_name -> list of finding dicts)
     findings: dict = field(default_factory=dict)
     # Commands executed (list of {cmd, stdout, stderr, phase})
     commands_log: list = field(default_factory=list)
@@ -104,7 +145,17 @@ class Config:
         ]:
             d.mkdir(parents=True, exist_ok=True)
 
+    _VALID_SEVERITIES = {"Critical", "High", "Medium", "Low", "Info"}
+
     def add_finding(self, phase: str, title: str, severity: str, detail: str, status: str = "Open") -> None:
+        severity = severity.strip().title()
+        if severity not in self._VALID_SEVERITIES:
+            import warnings
+            warnings.warn(
+                f"Invalid finding severity '{severity}' for '{title}' — defaulting to 'Info'",
+                stacklevel=2,
+            )
+            severity = "Info"
         self.findings.setdefault(phase, []).append(
             {"title": title, "severity": severity, "detail": detail, "status": status}
         )

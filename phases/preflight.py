@@ -10,7 +10,11 @@ import subprocess
 from rich.console import Console
 from rich.table import Table
 
+from typing import TYPE_CHECKING
 from core.config import REQUIRED_TOOLS
+
+if TYPE_CHECKING:
+    from core.adb import ADB
 
 console = Console()
 
@@ -31,6 +35,29 @@ def check_tool_version(name: str) -> str:
         except Exception:
             continue
     return "installed"
+
+
+def verify_device_prerequisites(adb: ADB) -> bool:
+    """Check if necessary components like Drozer are installed on the device itself."""
+    drozer_pkg = "com.withsecure.dz"
+    console.print("\n[cyan]Checking on-device prerequisites...[/cyan]")
+    
+    while not adb.is_package_installed(drozer_pkg):
+        console.print(f"\n[red]✗ Drozer Agent ({drozer_pkg}) is not installed on the device.[/red]")
+        console.print("Please install the Drozer Agent APK on the device using:")
+        console.print("[white]adb install path/to/drozer-agent.apk[/white]")
+        
+        from rich.prompt import Prompt
+        ans = Prompt.ask("Have you installed it now? (y/n/skip)", choices=["y", "n", "skip"], default="y")
+        if ans == "skip":
+            console.print("[yellow]Skipping Drozer agent check. Phase I tests will likely fail.[/yellow]")
+            return True
+        elif ans == "n":
+            console.print("[red]Aborting due to missing on-device prerequisites.[/red]")
+            return False
+            
+    console.print("[green]✓ Drozer Agent is installed on the device.[/green]")
+    return True
 
 
 def run_preflight() -> bool:
@@ -67,8 +94,27 @@ def run_preflight() -> bool:
 
     from core.adb import ADB
     devices = ADB.get_devices()
+
+    # Check for unauthorized/offline devices that wouldn't show in get_devices()
+    try:
+        raw = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10)
+        for line in raw.stdout.strip().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                if parts[1] == "unauthorized":
+                    console.print(
+                        f"\n[red bold]⚠ Device '{parts[0]}' found but USB debugging not authorized.[/red bold]"
+                    )
+                    console.print("  Tap [bold]'Allow USB debugging'[/bold] on the device and re-run.")
+                elif parts[1] == "offline":
+                    console.print(
+                        f"\n[yellow]⚠ Device '{parts[0]}' is offline. Reconnect the USB cable.[/yellow]"
+                    )
+    except Exception:
+        pass
+
     if not devices:
-        console.print("\n[red bold]✗ No Android device detected via ADB.[/red bold]")
+        console.print("\n[red bold]✗ No authorized Android device detected via ADB.[/red bold]")
         console.print("  Ensure USB debugging is enabled and the device is connected.")
         return False
 

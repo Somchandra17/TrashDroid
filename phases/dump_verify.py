@@ -7,14 +7,17 @@ SQLite queries, shared prefs parsing, and binary string extraction.
 
 from __future__ import annotations
 
+import re
 import subprocess
+import time
 from pathlib import Path
 
 from rich.console import Console
 from rich.prompt import Confirm
 
-from core.config import Config, SENSITIVE_PATTERNS
+from core.config import Config, SENSITIVE_PATTERNS, TIMING, LIMITS
 from core.adb import ADB
+from utils.helpers import grep_sensitive_lines
 
 console = Console()
 PHASE = "Phase IV — Dump File Verification"
@@ -56,10 +59,22 @@ def _deep_sqlite_analysis(config: Config, db_dir: Path) -> None:
     for db_file in db_files:
         try:
             # Get all table names
-            tables_out = subprocess.run(
+            result = subprocess.run(
                 ["sqlite3", str(db_file), ".tables"],
                 capture_output=True, text=True, timeout=10,
-            ).stdout.strip()
+            )
+            tables_out = result.stdout.strip()
+            stderr_out = result.stderr.strip().lower()
+
+            if "file is encrypted or is not a database" in stderr_out or "file is not a database" in stderr_out:
+                config.add_finding(
+                    PHASE,
+                    f"Encrypted Database Detected: {db_file.name}",
+                    "Info",
+                    f"Database '{db_file.name}' could not be read using standard sqlite3, which strongly implies it is encrypted (e.g., SQLCipher).\n\nError: {result.stderr.strip()}"
+                )
+                console.print(f"  [green]Encrypted DB detected:[/green] {db_file.name}")
+                continue
 
             if not tables_out:
                 continue
@@ -91,7 +106,6 @@ def _deep_sqlite_analysis(config: Config, db_dir: Path) -> None:
                 ).stdout.strip()
 
                 if select_out:
-                    import re
                     if re.search(SENSITIVE_PATTERNS, select_out, re.IGNORECASE):
                         config.add_finding(
                             PHASE,
@@ -112,7 +126,7 @@ def _deep_shared_prefs_analysis(config: Config, prefs_dir: Path) -> None:
 
     import xml.etree.ElementTree as ET
 
-    for xml_file in prefs_dir.glob("*.xml"):
+    for xml_file in prefs_dir.rglob("*.xml"):
         try:
             tree = ET.parse(xml_file)
             root = tree.getroot()
@@ -121,7 +135,6 @@ def _deep_shared_prefs_analysis(config: Config, prefs_dir: Path) -> None:
             for elem in root.iter():
                 name = elem.get("name", "")
                 value = elem.text or elem.get("value", "")
-                import re
                 if re.search(SENSITIVE_PATTERNS, name, re.IGNORECASE):
                     interesting_entries.append(f"  Key: {name} = {value}")
                 if value and re.search(SENSITIVE_PATTERNS, value, re.IGNORECASE):
@@ -151,16 +164,29 @@ def _binary_string_extraction(config: Config, base_dir: Path) -> None:
     console.print("[cyan]Extracting strings from binary/cache files...[/cyan]")
 
     binary_extensions = {".bin", ".dat", ".so", ".dex", ".realm", ".db", ""}
+    budget_start = time.monotonic()
+    max_time_secs = TIMING.db_query_timeout
+    max_files = LIMITS.max_binary_files
+    files_processed = 0
+
     for f in base_dir.rglob("*"):
+        # Budget checks
+        if files_processed >= max_files:
+            console.print(f"  [yellow]File count budget reached ({max_files} files). Stopping binary scan.[/yellow]")
+            break
+        if time.monotonic() - budget_start > max_time_secs:
+            console.print(f"  [yellow]Time budget reached ({max_time_secs}s). Stopping binary scan.[/yellow]")
+            break
+
         if not f.is_file() or f.stat().st_size > 50 * 1024 * 1024:  # skip >50MB
             continue
         if f.suffix in binary_extensions or f.suffix == "":
+            files_processed += 1
             try:
                 result = subprocess.run(
                     ["strings", str(f)],
                     capture_output=True, text=True, timeout=30,
                 )
-                import re
                 matches = [
                     line for line in result.stdout.splitlines()
                     if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
@@ -187,7 +213,6 @@ def _webview_analysis(config: Config, webview_dir: Path) -> None:
             continue
         try:
             content = f.read_text(encoding="utf-8", errors="replace")
-            import re
             if re.search(SENSITIVE_PATTERNS, content, re.IGNORECASE):
                 matches = [
                     line for line in content.splitlines()

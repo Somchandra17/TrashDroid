@@ -17,9 +17,10 @@ console = Console()
 
 
 class ScreenshotManager:
-    def __init__(self, adb, screenshot_dir: Path):
+    def __init__(self, adb, screenshot_dir: Path, config=None):
         self.adb = adb
         self.screenshot_dir = screenshot_dir
+        self.config = config
         self._scrcpy_proc: Optional[subprocess.Popen] = None
         self._counter = 0
 
@@ -48,11 +49,13 @@ class ScreenshotManager:
                 self._scrcpy_proc.kill()
             self._scrcpy_proc = None
 
-    def capture(self, phase: str, label: str, delay: float = 4.5) -> Optional[str]:
+    def capture(self, phase: str, label: str, delay: Optional[float] = None) -> Optional[str]:
         """
         Capture a screenshot with an optional delay (to let the UI settle).
         Returns the local file path or None on failure.
         """
+        if delay is None:
+            delay = self.config.screenshot_delay if self.config else 4.5
         time.sleep(delay)
         self._counter += 1
         ts = datetime.now().strftime("%H%M%S")

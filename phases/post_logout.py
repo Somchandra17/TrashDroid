@@ -15,17 +15,14 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from core.config import Config, FALSE_POSITIVE_PREFIXES
+from core.config import Config
 from core.adb import ADB
 from core.drozer import Drozer
 from core.screenshot import ScreenshotManager
+from utils.helpers import is_library_component
 
 console = Console()
 PHASE = "Phase IX — Post-Logout Access Control"
-
-
-def _is_library_component(name: str) -> bool:
-    return any(name.startswith(prefix) for prefix in FALSE_POSITIVE_PREFIXES)
 
 
 def run_post_logout_testing(config: Config, adb: ADB, drozer: Drozer, screenshotter: ScreenshotManager) -> None:
@@ -128,8 +125,8 @@ def _retest_activities_drozer(
         return
 
     # Filter out library components (same as Phase I)
-    activities = [a for a in all_activities if not _is_library_component(a)]
-    skipped = [a for a in all_activities if _is_library_component(a)]
+    activities = [a for a in all_activities if not is_library_component(a)]
+    skipped = [a for a in all_activities if is_library_component(a)]
 
     if skipped:
         console.print(f"  [dim]Skipping {len(skipped)} library component(s): {', '.join(skipped)}[/dim]")
@@ -181,7 +178,7 @@ def _test_direct_activity_access(config: Config, adb: ADB, ss: ScreenshotManager
     all_activities = _extract_activities_from_dumpsys(dumpsys_result.stdout, pkg)
 
     # Filter out library components
-    all_activities = [a for a in all_activities if not _is_library_component(a)]
+    all_activities = [a for a in all_activities if not is_library_component(a)]
 
     sensitive_keywords = [
         "profile", "account", "setting", "admin", "payment", "wallet",
@@ -214,7 +211,11 @@ def _test_direct_activity_access(config: Config, adb: ADB, ss: ScreenshotManager
         test_cases.append((act, ""))
         test_cases.append((act, "--ez is_admin true"))
         test_cases.append((act, "--ez bypass_auth true"))
+        test_cases.append((act, "--ez logged_in true"))
         test_cases.append((act, "--es user_id 1"))
+        test_cases.append((act, "--es role admin"))
+        test_cases.append((act, "--es token test_token"))
+        test_cases.append((act, "--es redirect_uri https://evil.com"))
 
     for act, extras in test_cases:
         adb.force_stop(pkg)
@@ -225,7 +226,17 @@ def _test_direct_activity_access(config: Config, adb: ADB, ss: ScreenshotManager
             result,
         )
 
-        accessible = "Error" not in result and "Exception" not in result
+        # Determine if the activity was actually accessible
+        result_lower = result.lower() if isinstance(result, str) else ""
+        blocked = (
+            "permission denial" in result_lower
+            or "securityexception" in result_lower
+            or "does not exist" in result_lower
+            or "unable to find" in result_lower
+            or "error type 3" in result_lower  # Activity class does not exist
+            or ("error" in result_lower and "starting" in result_lower)
+        )
+        accessible = not blocked and result.strip() != ""
         status = "[red]YES[/red]" if accessible else "[green]Blocked[/green]"
         table.add_row(act.split(".")[-1], extras or "(none)", status)
 

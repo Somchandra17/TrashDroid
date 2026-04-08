@@ -22,14 +22,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
 
-from core.config import Config, SENSITIVE_PATTERNS
+from core.config import Config, SENSITIVE_PATTERNS, LIMITS
 from core.adb import ADB
 
 console = Console()
 PHASE = "Phase VI — Memory Analysis"
 
 FRIDA_SERVER_PATH = "/data/local/tmp/frida-server"
-MAX_DUMP_MB = 32
+MAX_DUMP_MB = LIMITS.max_dump_mb
 
 
 def run_memory_analysis(config: Config, adb: ADB) -> None:
@@ -178,6 +178,16 @@ def _frida_dump(config: Config, adb: ADB, pkg: str, pid: str, local_path: str) -
 
     try:
         import frida
+
+        # Version compatibility check
+        pip_version = frida.__version__
+        server_ver_out = adb.shell(f"{FRIDA_SERVER_PATH} --version", root=True, timeout=5)
+        server_version = server_ver_out.stdout.strip()
+        if server_version and pip_version and server_version.split(".")[0] != pip_version.split(".")[0]:
+            console.print(
+                f"  [yellow]⚠ Frida version mismatch: pip={pip_version}, server={server_version}[/yellow]"
+            )
+            console.print("  [yellow]  This may cause attachment failures. Consider matching versions.[/yellow]")
 
         device = frida.get_usb_device(timeout=5)
         session = device.attach(int(pid))
@@ -358,12 +368,19 @@ def _dd_proc_mem(config: Config, adb: ADB, pid: str, local_path: str) -> bool:
 def _scan_dump_for_sensitive(config: Config, local_path: str) -> None:
     console.print("  [cyan]Scanning memory dump for sensitive data...[/cyan]")
     try:
+        # ASCII strings
         strings_result = subprocess.run(
             ["strings", local_path],
             capture_output=True, text=True, timeout=120,
         )
+        # UTF-16LE strings (Java strings are internally UTF-16)
+        strings_utf16 = subprocess.run(
+            ["strings", "-el", local_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        combined_output = strings_result.stdout + "\n" + strings_utf16.stdout
         sensitive = [
-            line for line in strings_result.stdout.splitlines()
+            line for line in combined_output.splitlines()
             if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
         ]
         if sensitive:

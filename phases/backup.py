@@ -73,8 +73,19 @@ def run_backup_analysis(config: Config, adb: ADB) -> None:
 
     # ── Extract backup ──
     console.print("[cyan]Extracting backup...[/cyan]")
-    extracted = _extract_backup(backup_ab, backup_tar, str(backup_dir))
-    config.log_command(PHASE, f"extract {backup_ab} → {backup_dir}", "Extracted" if extracted else "Failed")
+    extracted, info = _extract_backup(backup_ab, backup_tar, str(backup_dir))
+    config.log_command(PHASE, f"extract {backup_ab} → {backup_dir}", f"{info}" if extracted else f"Failed: {info}")
+
+    if not extracted and info.startswith("encrypted"):
+        config.add_finding(
+            PHASE,
+            "ADB backup is encrypted (positive security indicator)",
+            "Info",
+            f"The backup file uses AES encryption ({info}). "
+            "This prevents offline extraction of backup contents without the password.",
+        )
+        console.print(f"  [green]Backup is encrypted ({info}) — good security practice.[/green]")
+        return
 
     if not extracted:
         # Try alternative extraction with ABE
@@ -99,12 +110,28 @@ def run_backup_analysis(config: Config, adb: ADB) -> None:
     console.print(f"\n[green]✓ {PHASE} complete.[/green]")
 
 
-def _extract_backup(ab_path: str, tar_path: str, output_dir: str) -> bool:
-    """Extract .ab backup by stripping 24-byte header and zlib decompressing payload."""
+def _extract_backup(ab_path: str, tar_path: str, output_dir: str) -> tuple[bool, str]:
+    """Extract .ab backup by stripping 24-byte header and zlib decompressing payload.
+    Returns (success, info_message)."""
     try:
         raw = Path(ab_path).read_bytes()
         if len(raw) <= 24:
-            return False
+            return False, "Backup file too small"
+
+        # Parse backup header for version and encryption info
+        header_lines = raw[:200].split(b"\n")
+        version = "unknown"
+        encrypted = False
+        for line in header_lines:
+            decoded = line.decode("utf-8", errors="replace").strip()
+            if decoded.isdigit() and len(decoded) <= 2:
+                version = decoded
+            if decoded.lower() in ("aes-256", "aes"):
+                encrypted = True
+
+        if encrypted:
+            return False, f"encrypted_v{version}"
+
         payload = raw[24:]
         tar_bytes = zlib.decompress(payload)
         Path(tar_path).parent.mkdir(parents=True, exist_ok=True)
@@ -119,10 +146,10 @@ def _extract_backup(ab_path: str, tar_path: str, output_dir: str) -> bool:
                 capture_output=True,
             )
             if tar_result.returncode == 0:
-                return True
+                return True, "extracted"
     except (OSError, zlib.error, subprocess.TimeoutExpired):
-        return False
-    return False
+        return False, "zlib_or_encrypted"
+    return False, "failed"
 
 
 def _extract_backup_abe(ab_path: str, tar_path: str, output_dir: str) -> bool:
@@ -176,12 +203,19 @@ def _scan_backup_contents(config: Config, backup_dir: Path) -> None:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # Check for specific file types
+    # 8.3 Check for specific file types and apply deep analysis
     for pattern in ["*.db", "*.sqlite", "*.xml", "*.json", "*.txt", "*.log"]:
         files = list(backup_dir.rglob(pattern))
         if files:
             config.log_command(
                 PHASE,
-                f"find backup -name '{pattern}'",
-                "\n".join(str(f) for f in files[:50]),
+                f"find backup_contents -name '{pattern}'",
+                "\n".join(str(f) for f in files),
             )
+
+    try:
+        from phases.dump_verify import _deep_sqlite_analysis, _deep_shared_prefs_analysis
+        _deep_sqlite_analysis(config, backup_dir)
+        _deep_shared_prefs_analysis(config, backup_dir)
+    except Exception as e:
+        console.print(f"  [yellow]Error running deep backup analysis: {e}[/yellow]")

@@ -4,6 +4,10 @@ Setup phase — device selection, APK input, installation, permission grant, log
 
 from __future__ import annotations
 
+import hashlib
+import re
+from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
@@ -12,6 +16,15 @@ from core.adb import ADB
 from core.config import Config
 
 console = Console()
+
+_PKG_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$')
+
+
+def _validate_package_name(pkg: str) -> bool:
+    """Check if a string looks like a valid Android package name."""
+    if not pkg or ' ' in pkg or len(pkg) < 3:
+        return False
+    return bool(_PKG_RE.match(pkg))
 
 
 def select_device() -> str:
@@ -47,7 +60,11 @@ def get_apk_input(adb: ADB) -> tuple[str | None, str, bool]:
 
     if preinstalled:
         pkg = Prompt.ask("Enter the package name (adb shell pm list packages)")
-        return None, pkg.strip(), True
+        pkg = pkg.strip()
+        while not _validate_package_name(pkg):
+            console.print("[red]Invalid package name format. Expected: com.example.app[/red]")
+            pkg = Prompt.ask("Enter a valid package name").strip()
+        return None, pkg, True
 
     apk_path = Prompt.ask("Enter the full path to the APK file")
     apk_path = apk_path.strip().strip("'\"")
@@ -56,12 +73,21 @@ def get_apk_input(adb: ADB) -> tuple[str | None, str, bool]:
     if not pkg:
         pkg = Prompt.ask("Could not auto-detect package name. Enter it manually")
         pkg = pkg.strip()
+    while not _validate_package_name(pkg):
+        console.print("[red]Invalid package name format. Expected: com.example.app[/red]")
+        pkg = Prompt.ask("Enter a valid package name").strip()
 
     return apk_path, pkg, False
 
 
 def install_and_prepare(adb: ADB, config: Config) -> None:
-    """Install APK, prompt for permissions and login."""
+    """Install APK, compute hash, prompt for permissions and login."""
+    # Compute APK SHA-256 hash for evidence chain-of-custody
+    if config.apk_path and Path(config.apk_path).exists():
+        apk_hash = hashlib.sha256(Path(config.apk_path).read_bytes()).hexdigest()
+        config.apk_hash = apk_hash
+        console.print(f"  [dim]APK SHA-256: {apk_hash}[/dim]")
+
     if not config.is_preinstalled and config.apk_path:
         console.print(f"\n[cyan]Installing APK: {config.apk_path}[/cyan]")
         result = adb.install_apk(config.apk_path)
