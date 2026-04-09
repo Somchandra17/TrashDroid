@@ -36,6 +36,7 @@ TrashDroid is a terminal-based automation framework for **Dynamic Application Se
 | **Backup Analysis** | ADB backup extraction + sensitive data grep |
 | **Manifest Analysis** | `debuggable`, `allowBackup`, `usesCleartextTraffic`, exported components, dangerous permissions |
 | **Post-Logout Testing** | Re-launches activities after logout, privilege escalation via intent extras |
+| **Context-Aware PII Detection** | Advanced NLP matching via Microsoft Presidio and GLiNER ML models, replacing legacy regex checks |
 | **Auto Screenshots** | Captured after every test via `adb screencap` with optional `scrcpy` live mirror |
 | **AI-Ready Reports** | Markdown report with AI prompt header, findings, screenshots, and full command log |
 
@@ -200,6 +201,7 @@ python main.py --auto --device <SERIAL> --package <PKG> --apk /path/to/app.apk
 | `sqlite3` | Database analysis | Optional |
 | `strings` | Binary string extraction | Optional |
 | `aapt2` | Package name auto-detection | Optional |
+| `presidio-analyzer` | Advanced PII string scanning | Optional |
 | Python 3.10+ | Runtime | Yes |
 
 ### Target Device
@@ -251,6 +253,8 @@ python main.py --phases 3,5 --package com.example.app --device SERIAL --auto
 | `--phases 1,3,5` | Comma-separated phase numbers to run |
 | `--skip-preflight` | Skip tool availability checks |
 | `--report-mode` | `client` (default) or `internal` (includes AI prompt) |
+| `--presidio` | Enable Presidio PII detection (regex + checksum validators) |
+| `--ner` | Enable GLiNER NER backend for ML-based PII detection |
 
 ---
 
