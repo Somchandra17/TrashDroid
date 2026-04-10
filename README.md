@@ -37,7 +37,7 @@ TrashDroid is a terminal-based automation framework for **Dynamic Application Se
 | **Backup Analysis** | ADB backup extraction + sensitive data grep |
 | **Manifest Analysis** | `debuggable`, `allowBackup`, `usesCleartextTraffic`, exported components, dangerous permissions |
 | **Post-Logout Testing** | Re-launches activities after logout, privilege escalation via intent extras |
-| **Context-Aware PII Detection** | Advanced NLP matching via Microsoft Presidio and GLiNER ML models, replacing legacy regex checks |
+| **Context-Aware PII Detection** | Three-tier detection: regex-only (default, zero deps) → Presidio (`--presidio`, 30+ built-in recognizers + 5 custom security recognizers with checksum validation like Luhn/SSN/IBAN) → GLiNER NER (`--ner`, ML-based NLP detecting 50+ entity types). Graceful degradation to regex when backends are unavailable. Integrated across all scan phases. |
 | **Auto Screenshots** | Captured after every test via `adb screencap` with optional `scrcpy` live mirror |
 | **AI-Ready Reports** | Markdown report with AI prompt header, findings, screenshots, and full command log |
 
@@ -80,10 +80,18 @@ Your phone stays plugged into the **host machine**. The host runs the ADB server
 
 ### 1. Build the image
 
+**Standard build** (includes Presidio by default):
+
 ```bash
 git clone https://github.com/Somchandra17/TrashDroid.git
 cd TrashDroid
 docker build -t trashdroid .
+```
+
+**NER build** (includes Presidio + GLiNER ML model, ~560 MB additional):
+
+```bash
+docker build --build-arg ENABLE_NER=true -t trashdroid:ner .
 ```
 
 ### 2. Start ADB on the host
@@ -160,9 +168,12 @@ This gives the container direct USB access so it runs its own ADB server. Requir
 
 | What you want | Command |
 |---|---|
-| Build image | `docker build -t trashdroid .` |
+| Build image (Presidio) | `docker build -t trashdroid .` |
+| Build with NER | `docker build --build-arg ENABLE_NER=true -t trashdroid:ner .` |
 | Interactive run | `docker run -it --network host -v "$(pwd)/output:/app/output" trashdroid` |
+| NER interactive run | `docker run -it --network host -v "$(pwd)/output:/app/output" trashdroid:ner --ner` |
 | Auto run | `docker run -it --network host -v "$(pwd)/output:/app/output" trashdroid --auto --device SERIAL --package PKG` |
+| NER auto run | `docker run -it --network host -v "$(pwd)/output:/app/output" trashdroid:ner --ner --auto --device SERIAL --package PKG` |
 | Mount APK | Add `-v "/path/to/app.apk:/app/target.apk"` and `--apk /app/target.apk` |
 | Specific phases | Add `--phases 1,3,8` |
 | USB passthrough | Replace `--network host` with `--privileged -v /dev/bus/usb:/dev/bus/usb` |
@@ -176,16 +187,38 @@ This gives the container direct USB access so it runs its own ADB server. Requir
 ```bash
 git clone https://github.com/Somchandra17/TrashDroid.git
 cd TrashDroid
+```
 
+### 1. Base install (regex-only PII detection, zero extra deps)
+
+```bash
 pip install -r requirements.txt
-
-# Optional: PII detection backends
-pip install -r requirements-presidio.txt   # regex + checksum validators
-pip install -r requirements-ner.txt         # ML-based NER (~560 MB model)
-
 python main.py
+```
 
-# Or full auto
+This gives you the full 9-phase assessment with regex-based pattern matching for sensitive data. No additional Python packages beyond `rich` are required.
+
+### 2. Add Presidio (regex + checksum validators)
+
+```bash
+pip install -r requirements-presidio.txt
+python main.py --presidio --auto --device <SERIAL> --package <PKG>
+```
+
+Adds Microsoft Presidio with 30+ built-in recognizers, checksum validators (Luhn for credit cards, SSN format, IBAN), and 5 custom security recognizers (JWT, API_KEY, PRIVATE_KEY, AUTH_TOKEN, PASSWORD). ~50 MB download.
+
+### 3. Add GLiNER NER (ML-based PII detection)
+
+```bash
+pip install -r requirements-ner.txt
+python main.py --ner --auto --device <SERIAL> --package <PKG>
+```
+
+Adds the GLiNER NLP model (`urchade/gliner_multi_pii-v1`, ~560 MB downloaded on first run) that detects 50+ entity types using context-aware ML inference. `--ner` implies `--presidio`, so both engines run together.
+
+### Full auto mode
+
+```bash
 python main.py --auto --device <SERIAL> --package <PKG> --apk /path/to/app.apk
 ```
 
@@ -206,7 +239,8 @@ python main.py --auto --device <SERIAL> --package <PKG> --apk /path/to/app.apk
 | `sqlite3` | Database analysis | Optional |
 | `strings` | Binary string extraction | Optional |
 | `aapt2` | Package name auto-detection | Optional |
-| `presidio-analyzer` | Advanced PII string scanning | Optional |
+| `presidio-analyzer` | Advanced PII string scanning (regex + checksum validators) | Optional |
+| `presidio-analyzer[gliner]` | ML-based NER PII detection (50+ entity types) | Optional |
 | Python 3.10+ | Runtime | Yes |
 
 ### Target Device
@@ -260,6 +294,70 @@ python main.py --phases 3,5 --package com.example.app --device SERIAL --auto
 | `--report-mode` | `client` (default) or `internal` (includes AI prompt) |
 | `--presidio` | Enable Presidio PII detection (regex + checksum validators) |
 | `--ner` | Enable GLiNER NER backend for ML-based PII detection |
+
+---
+
+## Context-Aware PII Detection
+
+TrashDroid supports three tiers of PII (Personally Identifiable Information) detection, each building on the last. Higher tiers reduce false positives and detect more entity types at the cost of additional dependencies.
+
+### Why not regex-only?
+
+Legacy regex matching (`SENSITIVE_PATTERNS`) generates many false positives — a 16-digit number isn't always a credit card. Presidio adds **checksum validators** (Luhn for credit cards, SSN format checks, IBAN validation) and GLiNER adds **NLP-based entity recognition** that understands context (e.g., distinguishing a person's name from a street name).
+
+### Three Detection Tiers
+
+| Tier | Flag | Method | Dependencies | Model Size |
+|---|---|---|---|---|
+| Regex-only | *(default)* | Pattern matching via `SENSITIVE_PATTERNS` | None | — |
+| Presidio | `--presidio` | 30+ built-in recognizers + 5 custom security recognizers (JWT, API_KEY, PRIVATE_KEY, AUTH_TOKEN, PASSWORD) with checksum validation (Luhn, SSN, IBAN) | `presidio-analyzer` | ~50 MB |
+| GLiNER NER | `--ner` | ML-based NLP (`urchade/gliner_multi_pii-v1`) detecting 50+ entity types + all Presidio recognizers | `presidio-analyzer[gliner]` | ~560 MB |
+
+> `--ner` implies `--presidio` — the ML model runs alongside Presidio's checksum validators.
+
+### Entity Types Detected by GLiNER
+
+`person`, `email`, `phone number`, `credit card number`, `social security number`, `iban`, `date of birth`, `address`, `passport number`, `driver license number`, `bank account`, `medical record`, `insurance number`, `username`, `password`, `api key`, `token`, `url`, `ip address`
+
+### Severity Mapping
+
+Each PII entity type maps to a base severity, then adjusts based on confidence score:
+
+| Confidence Score | Severity Adjustment |
+|---|---|
+| ≥ 0.8 | Base severity (no change) |
+| 0.5 – 0.79 | Downgraded by 1 level |
+| < 0.5 | Downgraded by 2 levels |
+
+**Base severity by category:**
+
+| Category | Entity Types | Base Severity |
+|---|---|---|
+| Financial | `CREDIT_CARD`, `IBAN_CODE`, `US_BANK_NUMBER` | Critical |
+| Security (custom) | `JWT`, `API_KEY`, `PRIVATE_KEY`, `AUTH_TOKEN` | Critical |
+| Identity | `US_SSN`, `US_PASSPORT`, `US_ITIN` | Critical |
+| Identity | `US_DRIVER_LICENSE`, `MEDICAL_LICENSE`, `PERSON` | High |
+| Security (custom) | `PASSWORD` | High |
+| Contact | `EMAIL_ADDRESS`, `PHONE_NUMBER` | High |
+| Location/Time | `LOCATION`, `IP_ADDRESS`, `NRP` | Medium |
+| Other | `DATE_TIME`, `URL` | Low |
+
+### Integration
+
+The `PresidioEngine` singleton is lazily initialized and has **zero impact** when not enabled. When active, it runs across **all scan phases**: Filesystem, Logcat, Memory, Backup, and Dump Verification. Large inputs are chunked (2000 chars, 200 char overlap) for reliable analysis. If Presidio or GLiNER is not installed, the engine gracefully falls back to regex-only detection.
+
+### Example Commands
+
+```bash
+# Tier 1: Regex-only (default, no extra deps)
+python main.py --auto --device SERIAL --package com.example.app
+
+# Tier 2: Presidio (requires requirements-presidio.txt)
+python main.py --presidio --auto --device SERIAL --package com.example.app
+
+# Tier 3: GLiNER NER (requires requirements-ner.txt, ~560 MB model)
+python main.py --ner --auto --device SERIAL --package com.example.app
+```
 
 ---
 
@@ -409,6 +507,23 @@ TrashDroid/
 - If permission denied, the host directory may be owned by a different user — run `sudo chown -R $USER:$USER output/`
 </details>
 
+<details>
+<summary><b>Presidio not found / <code>ModuleNotFoundError: No module named 'presidio_analyzer'</code></b></summary>
+
+- Install the Presidio backend: `pip install -r requirements-presidio.txt`
+- Or run without `--presidio` to use regex-only detection
+- Docker users: Presidio is included by default in the standard image
+</details>
+
+<details>
+<summary><b>GLiNER model download fails or times out</b></summary>
+
+- The model is ~560 MB and downloads on first run — ensure stable internet
+- To pre-download: `python -c "from gliner import GLiNER; GLiNER.from_pretrained('urchade/gliner_multi_pii-v1')"`
+- Docker users: use `docker build --build-arg ENABLE_NER=true -t trashdroid:ner .` to cache the model at build time
+- Offline: set `GLINER_HOME` or place the model in `~/.cache/huggingface/hub/` manually
+</details>
+
 ---
 
 ## License
@@ -425,7 +540,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 <div align="center">
 
-**Built by [0xs0m](somm.tf)**
+**Built by [0xs0m](https://sommm.tf)**
 
 *If TrashDroid helped you find bugs, consider starring the repo.*
 
