@@ -95,7 +95,12 @@ def run_preflight() -> bool:
         table.add_row("presidio-analyzer", "[yellow]~ Optional[/yellow]", "pip install presidio-analyzer")
 
     try:
-        from presidio_analyzer.predefined_recognizers.gliner_recognizer import GLiNERRecognizer  # noqa: F401
+        try:
+            # Presidio >= 2.2.360
+            from presidio_analyzer.predefined_recognizers.ner.gliner_recognizer import GLiNERRecognizer  # noqa: F401
+        except ImportError:
+            # Older Presidio versions
+            from presidio_analyzer.predefined_recognizers.gliner_recognizer import GLiNERRecognizer  # noqa: F401
         table.add_row("GLiNER (NER)", "[green]✓ Found[/green]", "urchade/gliner_multi_pii-v1")
     except ImportError:
         table.add_row("GLiNER (NER)", "[yellow]~ Optional[/yellow]", 'pip install "presidio-analyzer[gliner]"')

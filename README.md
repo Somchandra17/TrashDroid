@@ -37,8 +37,9 @@ TrashDroid is a terminal-based automation framework for **Dynamic Application Se
 | **Backup Analysis** | ADB backup extraction + sensitive data grep |
 | **Manifest Analysis** | `debuggable`, `allowBackup`, `usesCleartextTraffic`, exported components, dangerous permissions |
 | **Post-Logout Testing** | Re-launches activities after logout, privilege escalation via intent extras |
-| **Context-Aware PII Detection** | Three-tier detection: regex-only (default, zero deps) → Presidio (`--presidio`, 30+ built-in recognizers + 5 custom security recognizers with checksum validation like Luhn/SSN/IBAN) → GLiNER NER (`--ner`, ML-based NLP detecting 50+ entity types). Graceful degradation to regex when backends are unavailable. Integrated across all scan phases. |
+| **Context-Aware PII Detection** | Three-tier detection: regex-only (default, zero deps) → Presidio (`--presidio`, 30+ built-in recognizers + 5 custom security recognizers with checksum validation like Luhn/SSN/IBAN) → GLiNER NER (`--ner`, ML-based NLP detecting 50+ entity types). `--presidio` degrades to regex with warning; `--ner` fails fast on backend init errors. Integrated across all scan phases. |
 | **Auto Screenshots** | Captured after every test via `adb screencap` with optional `scrcpy` live mirror |
+| **Runtime Hardening** | Deterministic logcat process teardown (foreground + background), idempotent global cleanup on signal/exit, and truthful startup backend mode reporting |
 | **AI-Ready Reports** | Markdown report with AI prompt header, findings, screenshots, and full command log |
 
 ---
@@ -292,8 +293,8 @@ python main.py --phases 3,5 --package com.example.app --device SERIAL --auto
 | `--phases 1,3,5` | Comma-separated phase numbers to run |
 | `--skip-preflight` | Skip tool availability checks |
 | `--report-mode` | `client` (default) or `internal` (includes AI prompt) |
-| `--presidio` | Enable Presidio PII detection (regex + checksum validators) |
-| `--ner` | Enable GLiNER NER backend for ML-based PII detection |
+| `--presidio` | Enable Presidio PII detection (regex + checksum validators); falls back to regex-only if initialization fails |
+| `--ner` | Enable GLiNER NER backend for ML-based PII detection; exits with error if NER backend fails to initialize |
 
 ---
 
@@ -344,7 +345,13 @@ Each PII entity type maps to a base severity, then adjusts based on confidence s
 
 ### Integration
 
-The `PresidioEngine` singleton is lazily initialized and has **zero impact** when not enabled. When active, it runs across **all scan phases**: Filesystem, Logcat, Memory, Backup, and Dump Verification. Large inputs are chunked (2000 chars, 200 char overlap) for reliable analysis. If Presidio or GLiNER is not installed, the engine gracefully falls back to regex-only detection.
+The `PresidioEngine` singleton has **zero impact** when not enabled. On startup, TrashDroid performs an eager backend warmup so detection mode is explicit before phases begin. When active, it runs across **all scan phases**: Filesystem, Logcat, Memory, Backup, and Dump Verification. Large inputs are chunked (2000 chars, 200 char overlap) for reliable analysis. If `--presidio` initialization fails, TrashDroid explicitly falls back to regex-only detection. If `--ner` initialization fails, TrashDroid exits with an error instead of silently degrading.
+
+### Reliability Hardening (Latest)
+
+- Startup now validates PII backend initialization before phases begin, so success messages only appear after real backend warmup.
+- Background and foreground logcat collectors now own and force-terminate child `adb logcat` processes on shutdown.
+- Cleanup is idempotent across normal exit, `SIGINT`, and `SIGTERM`, preventing orphan processes and duplicate partial-report generation.
 
 ### Example Commands
 

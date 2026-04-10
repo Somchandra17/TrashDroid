@@ -58,6 +58,34 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
     # Start logcat capture in background
     stop_event = threading.Event()
     log_lines: list[str] = []
+    proc_lock = threading.Lock()
+    proc_holder: dict[str, subprocess.Popen | None] = {"proc": None}
+
+    def _set_proc(proc: subprocess.Popen | None) -> None:
+        with proc_lock:
+            proc_holder["proc"] = proc
+
+    def _get_proc() -> subprocess.Popen | None:
+        with proc_lock:
+            return proc_holder["proc"]
+
+    def _terminate_capture_process() -> None:
+        proc = _get_proc()
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        _set_proc(None)
 
     def _capture_logcat():
         cmd = ["adb"]
@@ -66,6 +94,7 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
         cmd += ["logcat", "-v", "threadtime"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            _set_proc(proc)
             start = time.time()
             while not stop_event.is_set():
                 if proc.stdout is None:
@@ -73,15 +102,15 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
                 line = proc.stdout.readline()
                 if line:
                     log_lines.append(line)
-                if time.time() - start > auto_timeout:
+                elif proc.poll() is not None:
                     break
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                if time.time() - start > auto_timeout:
+                    stop_event.set()
+                    break
         except Exception as e:
             log_lines.append(f"[ERROR] Logcat capture failed: {e}\n")
+        finally:
+            _terminate_capture_process()
 
     capture_thread = threading.Thread(target=_capture_logcat, daemon=True)
     capture_thread.start()
@@ -100,7 +129,11 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
         input_event.wait(timeout=auto_timeout)
 
     stop_event.set()
+    _terminate_capture_process()
     capture_thread.join(timeout=5)
+    if capture_thread.is_alive():
+        _terminate_capture_process()
+        capture_thread.join(timeout=2)
 
     # Also dump any buffered logs
     dump_output = adb.logcat_dump()

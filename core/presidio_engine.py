@@ -199,22 +199,39 @@ class PresidioEngine:
         # ── Optional GLiNER NER backend ────────────────────────
         if self._use_gliner:
             try:
-                from presidio_analyzer.predefined_recognizers.gliner_recognizer import (
-                    GLiNERRecognizer,
-                )
+                try:
+                    # Presidio >= 2.2.360
+                    from presidio_analyzer.predefined_recognizers.ner.gliner_recognizer import (
+                        GLiNERRecognizer,
+                    )
+                except ImportError:
+                    # Older Presidio versions
+                    from presidio_analyzer.predefined_recognizers.gliner_recognizer import (
+                        GLiNERRecognizer,
+                    )
 
-                gliner_recognizer = GLiNERRecognizer(
-                    model_path="urchade/gliner_multi_pii-v1",
-                    entities=[
-                        "person", "email", "phone number", "credit card number",
-                        "social security number", "iban", "date of birth",
-                        "address", "passport number", "driver license number",
-                        "bank account", "medical record", "insurance number",
-                        "username", "password", "api key", "token", "url",
-                        "ip address",
-                    ],
-                    score_threshold=0.3,
-                )
+                entities = [
+                    "person", "email", "phone number", "credit card number",
+                    "social security number", "iban", "date of birth",
+                    "address", "passport number", "driver license number",
+                    "bank account", "medical record", "insurance number",
+                    "username", "password", "api key", "token", "url",
+                    "ip address",
+                ]
+                try:
+                    # Presidio >= 2.2.360
+                    gliner_recognizer = GLiNERRecognizer(
+                        supported_entities=entities,
+                        model_name="urchade/gliner_multi_pii-v1",
+                        threshold=0.3,
+                    )
+                except TypeError:
+                    # Older Presidio versions
+                    gliner_recognizer = GLiNERRecognizer(
+                        model_path="urchade/gliner_multi_pii-v1",
+                        entities=entities,
+                        score_threshold=0.3,
+                    )
                 analyzer.registry.add_recognizer(gliner_recognizer)
                 logger.info("GLiNER NER backend loaded (urchade/gliner_multi_pii-v1)")
             except ImportError:

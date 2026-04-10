@@ -21,6 +21,17 @@ All notable changes to the TrashDroid framework will be documented in this file.
 - Configurable screenshot delay now available via new `--screenshot-delay` CLI flag.
 - Improved app-sec `NOISE_TAGS` filtering for logcat dumps.
 - Manifest Phase logic upgraded with strict XML parsing for intent-filters and exported components.
+- PII startup behavior is now explicit and deterministic:
+  - `--presidio`: warns and falls back to regex-only on backend init failure.
+  - `--ner`: fails fast with non-zero exit on backend init failure (no silent downgrade).
+
+### Fixed
+- Fixed false-positive backend status where NER could be shown as enabled before analyzer warmup succeeded.
+- Hardened logcat process lifecycle:
+  - Background collector now owns and force-terminates `adb logcat` subprocesses deterministically.
+  - Phase V foreground collector now force-terminates stuck `adb logcat` subprocesses under low-log conditions.
+- Cleanup path now stops background logcat collectors during signal/exit handling and is idempotent to avoid duplicate cleanup/report behavior.
+- Added compatibility for new Presidio GLiNER module path and constructor args in recent versions (`predefined_recognizers.ner.gliner_recognizer`, `model_name`/`threshold`).
 
 ### Security
 - Shifted away from naive, regex-only `SENSITIVE_PATTERNS` to lower false-positive rates of data detection metrics.

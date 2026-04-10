@@ -15,7 +15,6 @@ import argparse
 import atexit
 import signal
 import sys
-import time
 import traceback
 from pathlib import Path
 
@@ -30,6 +29,8 @@ from core.adb import ADB
 from core.drozer import Drozer
 from core.screenshot import ScreenshotManager
 from core.report import ReportGenerator
+from core.pii_runtime import initialize_pii_detection
+from core.runtime_cleanup import RuntimeCleanupManager
 
 from phases.preflight import run_preflight
 from phases.setup import select_device, get_apk_input, install_and_prepare
@@ -110,12 +111,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--presidio",
         action="store_true",
-        help="Enable Presidio PII detection (regex + checksum validators like Luhn for credit cards)",
+        help="Enable Presidio PII detection (regex + checksum validators); falls back to regex-only on init failure",
     )
     parser.add_argument(
         "--ner",
         action="store_true",
-        help="Enable GLiNER NER backend for ML-based PII detection (implies --presidio, requires presidio-analyzer[gliner])",
+        help="Enable GLiNER NER backend for ML-based PII detection (implies --presidio, fails fast on init errors)",
     )
     return parser.parse_args()
 
@@ -196,38 +197,15 @@ def main() -> int:
     config.screenshot_delay = args.screenshot_delay
     config.init_output()
 
-    # ── Initialize Presidio PII detection engine ──
-    use_presidio = args.presidio or args.ner
-    if use_presidio:
-        try:
-            from core.presidio_engine import init_engine, is_available
-            if not is_available():
-                console.print(
-                    "[red]presidio-analyzer is not installed.[/red]\n"
-                    "  Install with: [white]pip install -r requirements-presidio.txt[/white]\n"
-                    "  Or: [white]pip install presidio-analyzer>=2.2.35[/white]"
-                )
-                console.print("[yellow]Falling back to regex-only PII scanning.[/yellow]")
-            else:
-                presidio_engine = init_engine(use_gliner=args.ner)
-                config.presidio_engine = presidio_engine
-                if args.ner:
-                    console.print(
-                        "[green]PII detection: Presidio + GLiNER NER "
-                        "(urchade/gliner_multi_pii-v1) enabled[/green]"
-                    )
-                else:
-                    console.print(
-                        "[green]PII detection: Presidio regex + checksum validators enabled[/green]"
-                    )
-        except Exception as e:
-            console.print(f"[red]Presidio initialization failed: {e}[/red]")
-            console.print("[yellow]Falling back to regex-only PII scanning.[/yellow]")
-    else:
-        console.print(
-            "[dim]PII detection: regex-only (default). "
-            "Use --presidio or --ner for enhanced detection.[/dim]"
-        )
+    # ── Initialize PII detection backend (eager warmup) ──
+    pii_init_rc = initialize_pii_detection(
+        config=config,
+        use_presidio=args.presidio,
+        use_ner=args.ner,
+        console=console,
+    )
+    if pii_init_rc != 0:
+        return pii_init_rc
 
     # ── Install & prepare ──
     install_and_prepare(adb, config)
@@ -236,29 +214,21 @@ def main() -> int:
     drozer = Drozer(device_id)
     screenshotter = ScreenshotManager(adb, config.screenshot_dir, config)
 
-    # ── Register cleanup handler (prevents orphan scrcpy + saves partial report) ──
-    _cleanup_state = {"screenshotter": screenshotter, "config": config, "device_info": device_info}
+    # ── Register cleanup handler (prevents orphan logcat/scrcpy + saves partial report) ──
+    cleanup_manager = RuntimeCleanupManager(
+        screenshotter=screenshotter,
+        config=config,
+        device_info=device_info,
+    )
 
-    def _cleanup():
-        ss = _cleanup_state.get("screenshotter")
-        if ss:
-            ss.stop_scrcpy()
-        cfg = _cleanup_state.get("config")
-        dinfo = _cleanup_state.get("device_info")
-        if cfg and dinfo and any(cfg.findings.values()):
-            try:
-                from core.report import ReportGenerator
-                reporter = ReportGenerator(cfg, dinfo)
-                path = reporter.generate()
-                print(f"\n[Cleanup] Partial report saved to: {path}")
-            except Exception:
-                pass
+    def _cleanup(generate_partial_report: bool = True):
+        cleanup_manager.cleanup(generate_partial_report=generate_partial_report)
 
     atexit.register(_cleanup)
 
     def _signal_handler(signum, frame):
         console.print(f"\n[yellow]Received signal {signum} — cleaning up...[/yellow]")
-        _cleanup()
+        _cleanup(generate_partial_report=True)
         sys.exit(128 + signum)
 
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -302,7 +272,7 @@ def main() -> int:
     bg_logcat = BackgroundLogcatCollector(device_id, config.package_name, config.output_dir)
     bg_logcat.start()
     console.print("[dim]Background logcat collector started.[/dim]")
-    _cleanup_state["bg_logcat"] = bg_logcat
+    cleanup_manager.set_background_collector(bg_logcat)
 
     # ── Execute phases ──
     phase_runners = {
@@ -355,6 +325,7 @@ def main() -> int:
     console.print("\n[bold cyan]═══ Generating Report ═══[/bold cyan]\n")
     reporter = ReportGenerator(config, device_info)
     report_path = reporter.generate()
+    cleanup_manager.mark_final_report_generated()
 
     total_findings = sum(len(v) for v in config.findings.values())
     total_screenshots = len(config.screenshots)

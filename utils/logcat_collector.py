@@ -10,7 +10,6 @@ from __future__ import annotations
 import re
 import subprocess
 import threading
-import time
 from pathlib import Path
 
 from core.config import SENSITIVE_PATTERNS
@@ -25,10 +24,14 @@ class BackgroundLogcatCollector:
         self.output_dir = output_dir
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._proc: subprocess.Popen | None = None
+        self._proc_lock = threading.Lock()
         self._lines: list[str] = []
 
     def start(self) -> None:
         """Start background logcat capture in a daemon thread."""
+        if self._thread and self._thread.is_alive():
+            return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -36,9 +39,44 @@ class BackgroundLogcatCollector:
     def stop(self) -> None:
         """Stop the background capture and save results."""
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
+        self._terminate_process(force_kill=True)
+
+        thread = self._thread
+        if thread:
+            thread.join(timeout=5)
+            if thread.is_alive():
+                self._terminate_process(force_kill=True)
+                thread.join(timeout=2)
+        self._thread = None
+
+    def _get_process(self) -> subprocess.Popen | None:
+        with self._proc_lock:
+            return self._proc
+
+    def _set_process(self, proc: subprocess.Popen | None) -> None:
+        with self._proc_lock:
+            self._proc = proc
+
+    def _terminate_process(self, force_kill: bool) -> None:
+        proc = self._get_process()
+        if proc is None:
+            return
+
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                if force_kill:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        self._set_process(None)
 
     def _capture_loop(self) -> None:
         cmd = ["adb"]
@@ -48,6 +86,7 @@ class BackgroundLogcatCollector:
 
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self._set_process(proc)
             while not self._stop_event.is_set():
                 if proc.stdout is None:
                     break
@@ -59,13 +98,10 @@ class BackgroundLogcatCollector:
                     # Cap at 50k lines to prevent memory issues
                     if len(self._lines) >= 50000:
                         break
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
         except Exception:
             pass
+        finally:
+            self._terminate_process(force_kill=True)
 
     def save_and_scan(self) -> list[dict]:
         """Save collected logs and return findings for sensitive data."""
@@ -128,4 +164,3 @@ class BackgroundLogcatCollector:
             })
 
         return findings
-
