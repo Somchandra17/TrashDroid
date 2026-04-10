@@ -11,6 +11,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)](Dockerfile)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![Changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-blue?style=flat-square)](CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/platform-Linux-FCC624?style=flat-square&logo=linux&logoColor=black)](https://github.com/Somchandra17/TrashDroid)
 ---
 
@@ -59,7 +60,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-> See the [Docker Guide](#docker-guide) below for full details, or [Native Install](#native-install) if you prefer running without Docker.
+> See the [Docker Guide](#docker-guide) below for full details, or [Native Install](#native-install) if you prefer running without Docker. For recent changes, see the [Changelog](CHANGELOG.md).
 
 ---
 
@@ -322,6 +323,7 @@ The generated `.md` report includes:
 ```
 TrashDroid/
 ├── main.py                 # Entry point & phase orchestrator
+├── CHANGELOG.md            # Version history & release notes
 ├── requirements.txt            # Base Python dependencies
 ├── requirements-presidio.txt   # Optional: Presidio PII detection
 ├── requirements-ner.txt        # Optional: GLiNER NER backend
