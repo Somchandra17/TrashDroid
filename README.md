@@ -540,7 +540,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 <div align="center">
 
-**Built by [0xs0m](https://sommm.tf)**
+**Built by [0xs0m](https://somm.tf)**
 
 *If TrashDroid helped you find bugs, consider starring the repo.*
 
