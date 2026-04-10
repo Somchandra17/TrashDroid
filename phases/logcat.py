@@ -17,6 +17,7 @@ from rich.panel import Panel
 
 from core.config import Config, SENSITIVE_PATTERNS
 from core.adb import ADB
+from utils.helpers import presidio_scan_text, presidio_findings_to_report
 
 console = Console()
 PHASE = "Phase V — Logcat Monitoring"
@@ -124,19 +125,32 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
 
     app_logs_text = "\n".join(app_logs)
 
-    # ── Scan for sensitive data ──
+    # ── Scan for sensitive data (Presidio batch or regex per-line) ──
     console.print("[cyan]Scanning logs for sensitive data...[/cyan]")
-    sensitive_lines = []
-    for line in app_logs_text.splitlines():
-        if any(tag in line for tag in NOISE_TAGS):
-            continue
-        if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE):
-            sensitive_lines.append(line.strip())
 
-    sensitive_output = "\n".join(sensitive_lines)
-    config.log_command(PHASE, "grep -iE '<patterns>' logcat_app_filtered.txt", sensitive_output[:5000])
+    # Filter out noise tags
+    filtered_lines = [
+        line for line in app_logs_text.splitlines()
+        if not any(tag in line for tag in NOISE_TAGS)
+    ]
+    filtered_text = "\n".join(filtered_lines)
 
-    if sensitive_lines:
+    pii_findings = presidio_scan_text(filtered_text, config, source_label="logcat")
+    if pii_findings and pii_findings[0].get("entity_type") != "SENSITIVE_PATTERN":
+        # Presidio found entity-level results
+        presidio_findings_to_report(
+            pii_findings, PHASE, config,
+            fallback_title="Sensitive data leaked in logcat",
+        )
+        console.print(f"  [red]Found {len(pii_findings)} PII entity(ies) in logcat![/red]")
+    elif pii_findings:
+        # Regex fallback found matches
+        sensitive_lines = []
+        for line in filtered_lines:
+            if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE):
+                sensitive_lines.append(line.strip())
+        sensitive_output = "\n".join(sensitive_lines)
+        config.log_command(PHASE, "grep -iE '<patterns>' logcat_app_filtered.txt", sensitive_output[:5000])
         config.add_finding(
             PHASE,
             f"Sensitive data leaked in logcat ({len(sensitive_lines)} lines)",

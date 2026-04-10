@@ -308,6 +308,26 @@ class ReportGenerator:
         self.config = config
         self.device_info = device_info
 
+    @staticmethod
+    def _extract_entity_type(finding: dict) -> str | None:
+        """Extract PII entity type from a Presidio-detected finding."""
+        detail = finding.get("detail", "")
+        if "Entity type:" in detail:
+            match = re.search(r"Entity type:\s*(\S+)", detail)
+            return match.group(1) if match else None
+        title = finding.get("title", "")
+        if title.startswith("PII detected:"):
+            match = re.match(r"PII detected:\s*(\S+)", title)
+            return match.group(1) if match else None
+        return None
+
+    @staticmethod
+    def _extract_confidence_score(finding: dict) -> float | None:
+        """Extract average confidence score from a Presidio-detected finding."""
+        detail = finding.get("detail", "")
+        match = re.search(r"Avg confidence:\s*([\d.]+)", detail)
+        return float(match.group(1)) if match else None
+
     def generate(self) -> str:
         c = self.config
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -371,6 +391,43 @@ class ReportGenerator:
         for row in coverage:
             sections.append(f"| {row['phase']} | {row['status']} | {row['findings']} |")
         sections.append("")
+
+        # ── PII Entity Summary (Presidio-detected findings only) ──
+        pii_entities: dict[str, dict] = {}  # entity_type -> {count, severities, scores}
+        for phase_findings in deduped_findings.values():
+            for f in phase_findings:
+                detail = f.get("detail", "")
+                # Parse entity type from Presidio-style findings
+                if "Entity type:" in detail:
+                    entity_match = re.search(r"Entity type:\s*(\S+)", detail)
+                    if entity_match:
+                        etype = entity_match.group(1)
+                        score_match = re.search(r"Avg confidence:\s*([\d.]+)", detail)
+                        avg_score = float(score_match.group(1)) if score_match else 0.0
+                        count_match = re.search(r"Occurrences:\s*(\d+)", detail)
+                        count = int(count_match.group(1)) if count_match else 1
+                        if etype not in pii_entities:
+                            pii_entities[etype] = {"count": 0, "severity": f["severity"], "scores": []}
+                        pii_entities[etype]["count"] += count
+                        pii_entities[etype]["scores"].append(avg_score)
+                elif f.get("title", "").startswith("PII detected:"):
+                    # Parse from title format: "PII detected: ENTITY_TYPE (N occurrences)"
+                    title_match = re.match(r"PII detected:\s*(\S+)\s*\((\d+)", f["title"])
+                    if title_match:
+                        etype = title_match.group(1)
+                        count = int(title_match.group(2))
+                        if etype not in pii_entities:
+                            pii_entities[etype] = {"count": 0, "severity": f["severity"], "scores": []}
+                        pii_entities[etype]["count"] += count
+
+        if pii_entities:
+            sections.append("## PII Entities Detected\n")
+            sections.append("| Entity Type | Count | Highest Severity | Avg Confidence |")
+            sections.append("|-------------|-------|------------------|----------------|")
+            for etype, info in sorted(pii_entities.items(), key=lambda x: x[1]["count"], reverse=True):
+                avg_conf = sum(info["scores"]) / len(info["scores"]) if info["scores"] else 0.0
+                sections.append(f"| {etype} | {info['count']} | {info['severity']} | {avg_conf:.2f} |")
+            sections.append("")
 
         # ── Per-phase findings ──
         sections.append("---\n## Detailed Findings\n")
@@ -507,6 +564,9 @@ class ReportGenerator:
                     "business_impact": _business_impact_for_finding(f["title"], normalized_detail),
                     "occurrences": f.get("occurrences", 1),
                     "detail": normalized_detail[:5000],
+                    # PII entity metadata (populated for Presidio-detected findings)
+                    "entity_type": self._extract_entity_type(f),
+                    "confidence_score": self._extract_confidence_score(f),
                 })
 
         json_export = {

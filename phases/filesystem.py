@@ -16,7 +16,7 @@ from rich.prompt import Confirm
 
 from core.config import Config, SENSITIVE_PATTERNS
 from core.adb import ADB
-from utils.helpers import grep_sensitive_lines
+from utils.helpers import grep_sensitive_lines, presidio_scan_text, presidio_findings_to_report
 
 console = Console()
 PHASE = "Phase III — Local File System Analysis"
@@ -84,7 +84,7 @@ def run_filesystem_analysis(config: Config, adb: ADB) -> None:
 
     # NOTE: Full data dir pull removed (was redundant with individual subdirectory pulls above).
 
-    # ── Grep scan for sensitive data ──
+    # ── Scan for sensitive data (Presidio or grep fallback) ──
     console.print("\n[cyan]Scanning pulled files for sensitive data...[/cyan]")
     grep_results = _grep_sensitive(str(local_base))
 
@@ -95,12 +95,21 @@ def run_filesystem_analysis(config: Config, adb: ADB) -> None:
 
     if grep_results.strip():
         lines = grep_results.strip().splitlines()
-        config.add_finding(
-            PHASE,
-            f"Sensitive data found in local storage ({len(lines)} matches)",
-            "High",
-            grep_results[:5000],
-        )
+        # Run Presidio analysis on grep results for richer entity detection
+        pii_findings = presidio_scan_text(grep_results, config, source_label="filesystem_grep")
+        if pii_findings and pii_findings[0].get("entity_type") != "SENSITIVE_PATTERN":
+            presidio_findings_to_report(
+                pii_findings, PHASE, config,
+                fallback_title=f"Sensitive data found in local storage ({len(lines)} matches)",
+                fallback_detail=grep_results[:5000],
+            )
+        else:
+            config.add_finding(
+                PHASE,
+                f"Sensitive data found in local storage ({len(lines)} matches)",
+                "High",
+                grep_results[:5000],
+            )
         console.print(f"  [red]Found {len(lines)} sensitive data match(es) — saved to grep_results.txt[/red]")
     else:
         console.print("  [green]No obvious sensitive data patterns found in pulled files.[/green]")
@@ -149,12 +158,21 @@ def _on_device_grep_fallback(config: Config, adb: ADB, remote_path: str) -> None
         config.log_command(PHASE, f"on-device grep {remote_path}", output[:5000])
         if output:
             lines = output.splitlines()
-            config.add_finding(
-                PHASE,
-                f"Sensitive data found on-device (grep fallback): {remote_path}",
-                "High",
-                f"Could not pull files locally, but on-device grep found {len(lines)} match(es):\n\n{output[:5000]}",
-            )
+            # Analyze grep output with Presidio for entity-level detection
+            pii = presidio_scan_text(output, config, source_label=f"on-device:{remote_path}")
+            if pii and pii[0].get("entity_type") != "SENSITIVE_PATTERN":
+                presidio_findings_to_report(
+                    pii, PHASE, config,
+                    fallback_title=f"Sensitive data found on-device (grep fallback): {remote_path}",
+                    fallback_detail=f"Could not pull files locally, but on-device grep found {len(lines)} match(es):\n\n{output[:5000]}",
+                )
+            else:
+                config.add_finding(
+                    PHASE,
+                    f"Sensitive data found on-device (grep fallback): {remote_path}",
+                    "High",
+                    f"Could not pull files locally, but on-device grep found {len(lines)} match(es):\n\n{output[:5000]}",
+                )
             console.print(f"    [red]On-device grep found {len(lines)} sensitive match(es)[/red]")
         else:
             console.print(f"    [green]On-device grep: no sensitive data[/green]")
@@ -216,13 +234,13 @@ def _analyze_databases(config: Config, base_dir: str) -> None:
             dump_path.parent.mkdir(parents=True, exist_ok=True)
             dump_path.write_text(dump_result.stdout, encoding="utf-8")
 
-            sensitive_in_db = grep_sensitive_lines(dump_result.stdout)
-            if sensitive_in_db:
-                config.add_finding(
-                    PHASE,
-                    f"Sensitive data in database: {db_file.name}",
-                    "High",
-                    f"Tables: {tables}\n\nSensitive matches:\n{sensitive_in_db[:3000]}",
+            # Presidio or regex scan on DB dump
+            pii = presidio_scan_text(dump_result.stdout, config, source_label=f"db:{db_file.name}")
+            if pii:
+                presidio_findings_to_report(
+                    pii, PHASE, config,
+                    fallback_title=f"Sensitive data in database: {db_file.name}",
+                    fallback_detail=f"Tables: {tables}\n\nSensitive matches:\n{grep_sensitive_lines(dump_result.stdout)[:3000]}",
                 )
                 console.print(f"    [red]Sensitive data found in {db_file.name}[/red]")
         except FileNotFoundError:
@@ -250,13 +268,12 @@ def _analyze_shared_prefs(config: Config, prefs_dir: str) -> None:
             content = xml_file.read_text(encoding="utf-8", errors="replace")
             config.log_command(PHASE, f"cat shared_prefs/{xml_file.name}", content[:2000])
 
-            sensitive = grep_sensitive_lines(content)
-            if sensitive:
-                config.add_finding(
-                    PHASE,
-                    f"Sensitive data in shared_prefs: {xml_file.name}",
-                    "High",
-                    f"File: {xml_file.name}\n\nMatches:\n{sensitive[:3000]}",
+            pii = presidio_scan_text(content, config, source_label=f"shared_prefs:{xml_file.name}")
+            if pii:
+                presidio_findings_to_report(
+                    pii, PHASE, config,
+                    fallback_title=f"Sensitive data in shared_prefs: {xml_file.name}",
+                    fallback_detail=f"File: {xml_file.name}\n\nMatches:\n{grep_sensitive_lines(content)[:3000]}",
                 )
                 console.print(f"    [red]Sensitive data found in {xml_file.name}[/red]")
         except Exception as e:
@@ -289,13 +306,12 @@ def _analyze_nosql(config: Config, adb: ADB, pkg: str, base_dir: str) -> None:
                 ["strings", str(f)],
                 capture_output=True, text=True, timeout=30,
             )
-            sensitive = grep_sensitive_lines(result.stdout)
-            if sensitive:
-                config.add_finding(
-                    PHASE,
-                    f"Sensitive data in NoSQL file: {f.name}",
-                    "High",
-                    f"File: {f}\n\nSensitive strings:\n{sensitive[:3000]}",
+            pii = presidio_scan_text(result.stdout, config, source_label=f"nosql:{f.name}")
+            if pii:
+                presidio_findings_to_report(
+                    pii, PHASE, config,
+                    fallback_title=f"Sensitive data in NoSQL file: {f.name}",
+                    fallback_detail=f"File: {f}\n\nSensitive strings:\n{grep_sensitive_lines(result.stdout)[:3000]}",
                 )
         except FileNotFoundError:
             pass

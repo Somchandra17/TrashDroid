@@ -77,8 +77,40 @@ class BackgroundLogcatCollector:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("".join(self._lines), encoding="utf-8")
 
-        # Scan for sensitive data
         findings = []
+        full_text = "".join(self._lines)
+
+        # Try Presidio post-scan for entity-level detection
+        try:
+            from core.presidio_engine import get_engine
+            engine = get_engine()
+            if engine is not None:
+                pii_results = engine.analyze_text_for_findings(
+                    full_text, source_label="background_logcat"
+                )
+                if pii_results:
+                    # Group by entity type for cleaner reporting
+                    entity_groups: dict[str, list[dict]] = {}
+                    for r in pii_results:
+                        entity_groups.setdefault(r["entity_type"], []).append(r)
+
+                    for entity_type, group in entity_groups.items():
+                        avg_score = sum(g["score"] for g in group) / len(group)
+                        samples = [g["text"] for g in group[:5]]
+                        findings.append({
+                            "title": f"PII detected in background logcat: {entity_type} ({len(group)} occurrence{'s' if len(group) > 1 else ''})",
+                            "severity": group[0].get("severity", "High"),
+                            "detail": (
+                                f"Background logcat monitoring detected {len(group)} "
+                                f"{entity_type} entity(ies) (avg confidence: {avg_score:.2f}).\n\n"
+                                f"Sample matches:\n" + "\n".join(f"  - {s}" for s in samples)
+                            ),
+                        })
+                    return findings
+        except Exception:
+            pass  # Fall through to regex
+
+        # Regex fallback scan
         sensitive_lines = []
         for line in self._lines:
             if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE):
@@ -96,3 +128,4 @@ class BackgroundLogcatCollector:
             })
 
         return findings
+

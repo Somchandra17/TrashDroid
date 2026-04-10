@@ -24,6 +24,7 @@ from rich.prompt import Confirm
 
 from core.config import Config, SENSITIVE_PATTERNS, LIMITS
 from core.adb import ADB
+from utils.helpers import presidio_scan_text, presidio_findings_to_report
 
 console = Console()
 PHASE = "Phase VI — Memory Analysis"
@@ -379,18 +380,29 @@ def _scan_dump_for_sensitive(config: Config, local_path: str) -> None:
             capture_output=True, text=True, timeout=120,
         )
         combined_output = strings_result.stdout + "\n" + strings_utf16.stdout
-        sensitive = [
-            line for line in combined_output.splitlines()
-            if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
-        ]
-        if sensitive:
-            config.add_finding(
-                PHASE,
-                f"Sensitive data in process memory ({len(sensitive)} matches)",
-                "High",
-                "Sensitive strings found in application memory:\n\n" + "\n".join(sensitive[:200]),
+
+        # Use Presidio for entity-level detection or fall back to regex
+        pii = presidio_scan_text(combined_output, config, source_label="memory_dump")
+        if pii and pii[0].get("entity_type") != "SENSITIVE_PATTERN":
+            presidio_findings_to_report(
+                pii, PHASE, config,
+                fallback_title="Sensitive data in process memory",
             )
-            console.print(f"  [red]Found {len(sensitive)} sensitive string(s) in memory![/red]")
+            console.print(f"  [red]Found {len(pii)} PII entity(ies) in memory dump![/red]")
+        elif pii:
+            # Regex fallback
+            sensitive = [
+                line for line in combined_output.splitlines()
+                if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
+            ]
+            if sensitive:
+                config.add_finding(
+                    PHASE,
+                    f"Sensitive data in process memory ({len(sensitive)} matches)",
+                    "High",
+                    "Sensitive strings found in application memory:\n\n" + "\n".join(sensitive[:200]),
+                )
+                console.print(f"  [red]Found {len(sensitive)} sensitive string(s) in memory![/red]")
         else:
             console.print("  [green]No obvious sensitive strings in memory dump.[/green]")
     except subprocess.TimeoutExpired:
@@ -433,16 +445,11 @@ def _memory_strings(config: Config, adb: ADB, pid: str) -> None:
         timeout=15,
     )
     if mem_result.stdout.strip():
-        sensitive = [
-            line for line in mem_result.stdout.splitlines()
-            if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
-        ]
-        if sensitive:
-            config.add_finding(
-                PHASE,
-                "Sensitive data in process environment/cmdline",
-                "High",
-                "\n".join(sensitive[:100]),
+        pii = presidio_scan_text(mem_result.stdout, config, source_label="process_env")
+        if pii:
+            presidio_findings_to_report(
+                pii, PHASE, config,
+                fallback_title="Sensitive data in process environment/cmdline",
             )
 
 

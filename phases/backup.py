@@ -16,6 +16,7 @@ from rich.prompt import Confirm
 
 from core.config import Config, SENSITIVE_PATTERNS
 from core.adb import ADB
+from utils.helpers import presidio_scan_text, presidio_findings_to_report
 
 console = Console()
 PHASE = "Phase VII — ADB Backup Analysis"
@@ -187,12 +188,22 @@ def _scan_backup_contents(config: Config, backup_dir: Path) -> None:
         )
         if result.stdout.strip():
             lines = result.stdout.strip().splitlines()
-            config.add_finding(
-                PHASE,
-                f"Sensitive data in ADB backup ({len(lines)} matches)",
-                "High",
-                f"Backup extraction revealed sensitive data:\n\n{result.stdout[:5000]}",
-            )
+
+            # Analyze with Presidio for entity-level detection
+            pii = presidio_scan_text(result.stdout, config, source_label="backup")
+            if pii and pii[0].get("entity_type") != "SENSITIVE_PATTERN":
+                presidio_findings_to_report(
+                    pii, PHASE, config,
+                    fallback_title=f"Sensitive data in ADB backup ({len(lines)} matches)",
+                    fallback_detail=f"Backup extraction revealed sensitive data:\n\n{result.stdout[:5000]}",
+                )
+            else:
+                config.add_finding(
+                    PHASE,
+                    f"Sensitive data in ADB backup ({len(lines)} matches)",
+                    "High",
+                    f"Backup extraction revealed sensitive data:\n\n{result.stdout[:5000]}",
+                )
             console.print(f"  [red]Found {len(lines)} sensitive match(es) in backup![/red]")
 
             backup_grep_path = config.output_dir / "backup_grep_results.txt"

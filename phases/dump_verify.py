@@ -17,7 +17,7 @@ from rich.prompt import Confirm
 
 from core.config import Config, SENSITIVE_PATTERNS, TIMING, LIMITS
 from core.adb import ADB
-from utils.helpers import grep_sensitive_lines
+from utils.helpers import grep_sensitive_lines, presidio_scan_text, presidio_findings_to_report
 
 console = Console()
 PHASE = "Phase IV — Dump File Verification"
@@ -106,13 +106,15 @@ def _deep_sqlite_analysis(config: Config, db_dir: Path) -> None:
                 ).stdout.strip()
 
                 if select_out:
-                    if re.search(SENSITIVE_PATTERNS, select_out, re.IGNORECASE):
-                        config.add_finding(
-                            PHASE,
-                            f"Sensitive data in table {table} ({db_file.name})",
-                            "High",
-                            f"Database: {db_file.name}\nTable: {table}\nRows: {count_out}\n"
-                            f"Sample data:\n{select_out[:2000]}",
+                    pii = presidio_scan_text(select_out, config, source_label=f"db_table:{db_file.name}/{table}")
+                    if pii:
+                        presidio_findings_to_report(
+                            pii, PHASE, config,
+                            fallback_title=f"Sensitive data in table {table} ({db_file.name})",
+                            fallback_detail=(
+                                f"Database: {db_file.name}\nTable: {table}\nRows: {count_out}\n"
+                                f"Sample data:\n{select_out[:2000]}"
+                            ),
                         )
 
         except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
@@ -131,18 +133,44 @@ def _deep_shared_prefs_analysis(config: Config, prefs_dir: Path) -> None:
             tree = ET.parse(xml_file)
             root = tree.getroot()
             interesting_entries = []
+            seen_keys: set[str] = set()  # Prevent duplicate entries
 
+            # Collect all key=value pairs for batch analysis
+            all_pairs: list[tuple[str, str]] = []
             for elem in root.iter():
                 name = elem.get("name", "")
                 value = elem.text or elem.get("value", "")
-                if re.search(SENSITIVE_PATTERNS, name, re.IGNORECASE):
-                    interesting_entries.append(f"  Key: {name} = {value}")
-                if value and re.search(SENSITIVE_PATTERNS, value, re.IGNORECASE):
-                    interesting_entries.append(f"  Key: {name} = {value}")
+                if name:
+                    all_pairs.append((name, value))
 
                 # Check for boolean flags that might control features
-                if elem.tag == "boolean" and name:
+                if elem.tag == "boolean" and name and name not in seen_keys:
                     interesting_entries.append(f"  [bool] {name} = {value}")
+                    seen_keys.add(name)
+
+            # Batch scan all key=value text at once for efficiency
+            batch_text = "\n".join(f"{n}={v}" for n, v in all_pairs if n)
+            pii_findings = presidio_scan_text(batch_text, config, source_label=f"prefs:{xml_file.name}")
+
+            # If Presidio found entity-level results, map matched text back to keys
+            pii_matched_texts = set()
+            if pii_findings and pii_findings[0].get("entity_type") != "SENSITIVE_PATTERN":
+                for pf in pii_findings:
+                    pii_matched_texts.add(pf.get("text", ""))
+
+            for name, value in all_pairs:
+                if name in seen_keys:
+                    continue
+                # Check via regex OR if Presidio matched something in this entry
+                entry_text = f"{name}={value}"
+                is_sensitive = (
+                    re.search(SENSITIVE_PATTERNS, name, re.IGNORECASE) or
+                    (value and re.search(SENSITIVE_PATTERNS, value, re.IGNORECASE)) or
+                    any(mt in entry_text for mt in pii_matched_texts if mt)
+                )
+                if is_sensitive:
+                    interesting_entries.append(f"  Key: {name} = {value}")
+                    seen_keys.add(name)
 
             if interesting_entries:
                 config.add_finding(
@@ -187,16 +215,15 @@ def _binary_string_extraction(config: Config, base_dir: Path) -> None:
                     ["strings", str(f)],
                     capture_output=True, text=True, timeout=30,
                 )
-                matches = [
-                    line for line in result.stdout.splitlines()
-                    if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
-                ]
-                if matches:
-                    config.add_finding(
-                        PHASE,
-                        f"Sensitive strings in binary: {f.name}",
-                        "Medium",
-                        f"File: {f}\n\n" + "\n".join(matches[:100]),
+                pii = presidio_scan_text(result.stdout, config, source_label=f"binary:{f.name}")
+                if pii:
+                    presidio_findings_to_report(
+                        pii, PHASE, config,
+                        fallback_title=f"Sensitive strings in binary: {f.name}",
+                        fallback_detail=f"File: {f}\n\n" + "\n".join(
+                            line for line in result.stdout.splitlines()
+                            if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
+                        )[:3000],
                     )
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 pass
@@ -213,17 +240,15 @@ def _webview_analysis(config: Config, webview_dir: Path) -> None:
             continue
         try:
             content = f.read_text(encoding="utf-8", errors="replace")
-            if re.search(SENSITIVE_PATTERNS, content, re.IGNORECASE):
-                matches = [
-                    line for line in content.splitlines()
-                    if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
-                ]
-                if matches:
-                    config.add_finding(
-                        PHASE,
-                        f"Sensitive data in WebView storage: {f.name}",
-                        "High",
-                        f"File: {f}\n\n" + "\n".join(matches[:50]),
-                    )
+            pii = presidio_scan_text(content, config, source_label=f"webview:{f.name}")
+            if pii:
+                presidio_findings_to_report(
+                    pii, PHASE, config,
+                    fallback_title=f"Sensitive data in WebView storage: {f.name}",
+                    fallback_detail=f"File: {f}\n\n" + "\n".join(
+                        line for line in content.splitlines()
+                        if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
+                    )[:3000],
+                )
         except Exception:
             pass

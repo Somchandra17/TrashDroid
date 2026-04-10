@@ -178,6 +178,10 @@ cd TrashDroid
 
 pip install -r requirements.txt
 
+# Optional: PII detection backends
+pip install -r requirements-presidio.txt   # regex + checksum validators
+pip install -r requirements-ner.txt         # ML-based NER (~560 MB model)
+
 python main.py
 
 # Or full auto
@@ -318,7 +322,9 @@ The generated `.md` report includes:
 ```
 TrashDroid/
 ├── main.py                 # Entry point & phase orchestrator
-├── requirements.txt        # Python dependencies
+├── requirements.txt            # Base Python dependencies
+├── requirements-presidio.txt   # Optional: Presidio PII detection
+├── requirements-ner.txt        # Optional: GLiNER NER backend
 ├── core/
 │   ├── config.py           # Global state, patterns, flags
 │   ├── adb.py              # ADB command wrapper

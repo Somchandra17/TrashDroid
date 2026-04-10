@@ -107,6 +107,16 @@ def parse_args() -> argparse.Namespace:
         default=4.5,
         help="Delay in seconds before capturing a screenshot (default: 4.5)",
     )
+    parser.add_argument(
+        "--presidio",
+        action="store_true",
+        help="Enable Presidio PII detection (regex + checksum validators like Luhn for credit cards)",
+    )
+    parser.add_argument(
+        "--ner",
+        action="store_true",
+        help="Enable GLiNER NER backend for ML-based PII detection (implies --presidio, requires presidio-analyzer[gliner])",
+    )
     return parser.parse_args()
 
 
@@ -185,6 +195,39 @@ def main() -> int:
     config.report_mode = args.report
     config.screenshot_delay = args.screenshot_delay
     config.init_output()
+
+    # ── Initialize Presidio PII detection engine ──
+    use_presidio = args.presidio or args.ner
+    if use_presidio:
+        try:
+            from core.presidio_engine import init_engine, is_available
+            if not is_available():
+                console.print(
+                    "[red]presidio-analyzer is not installed.[/red]\n"
+                    "  Install with: [white]pip install -r requirements-presidio.txt[/white]\n"
+                    "  Or: [white]pip install presidio-analyzer>=2.2.35[/white]"
+                )
+                console.print("[yellow]Falling back to regex-only PII scanning.[/yellow]")
+            else:
+                presidio_engine = init_engine(use_gliner=args.ner)
+                config.presidio_engine = presidio_engine
+                if args.ner:
+                    console.print(
+                        "[green]PII detection: Presidio + GLiNER NER "
+                        "(urchade/gliner_multi_pii-v1) enabled[/green]"
+                    )
+                else:
+                    console.print(
+                        "[green]PII detection: Presidio regex + checksum validators enabled[/green]"
+                    )
+        except Exception as e:
+            console.print(f"[red]Presidio initialization failed: {e}[/red]")
+            console.print("[yellow]Falling back to regex-only PII scanning.[/yellow]")
+    else:
+        console.print(
+            "[dim]PII detection: regex-only (default). "
+            "Use --presidio or --ner for enhanced detection.[/dim]"
+        )
 
     # ── Install & prepare ──
     install_and_prepare(adb, config)

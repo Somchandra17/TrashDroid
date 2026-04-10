@@ -86,6 +86,20 @@ def run_preflight() -> bool:
         status = "[green]✓ Found[/green]" if found else "[yellow]~ Optional[/yellow]"
         table.add_row(extra, status, version)
 
+    # Check Python package availability for Presidio/GLiNER
+    try:
+        import presidio_analyzer
+        presidio_ver = getattr(presidio_analyzer, "__version__", "installed")
+        table.add_row("presidio-analyzer", "[green]✓ Found[/green]", str(presidio_ver))
+    except ImportError:
+        table.add_row("presidio-analyzer", "[yellow]~ Optional[/yellow]", "pip install presidio-analyzer")
+
+    try:
+        from presidio_analyzer.predefined_recognizers.gliner_recognizer import GLiNERRecognizer  # noqa: F401
+        table.add_row("GLiNER (NER)", "[green]✓ Found[/green]", "urchade/gliner_multi_pii-v1")
+    except ImportError:
+        table.add_row("GLiNER (NER)", "[yellow]~ Optional[/yellow]", 'pip install "presidio-analyzer[gliner]"')
+
     console.print(table)
 
     if not all_ok:

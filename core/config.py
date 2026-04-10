@@ -120,6 +120,10 @@ class Config:
 
     screenshot_delay: float = 4.5
 
+    # Presidio PII detection engine (None when not enabled)
+    presidio_engine: object = None
+
+
     # accumulated findings per phase (phase_name -> list of finding dicts)
     findings: dict = field(default_factory=dict)
     # Commands executed (list of {cmd, stdout, stderr, phase})
