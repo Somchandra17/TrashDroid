@@ -8,6 +8,7 @@
 
 **Automated Android DAST Framework**
 
+[![CI](https://github.com/Somchandra17/TrashDroid/actions/workflows/ci.yml/badge.svg)](https://github.com/Somchandra17/TrashDroid/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)](Dockerfile)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
@@ -199,6 +200,8 @@ python main.py
 
 This gives you the full 9-phase assessment with regex-based pattern matching for sensitive data. No additional Python packages beyond `rich` are required.
 
+> Prefer an editable package install? `pip install -e .` works too (optional PII extras: `pip install -e ".[presidio]"` or `pip install -e ".[ner]"`), and exposes a `trashdroid` console command equivalent to `python main.py`.
+
 ### 2. Add Presidio (regex + checksum validators)
 
 ```bash
@@ -292,7 +295,8 @@ python main.py --phases 3,5 --package com.example.app --device SERIAL --auto
 | `--apk PATH` | Path to APK file (omit if pre-installed) |
 | `--phases 1,3,5` | Comma-separated phase numbers to run |
 | `--skip-preflight` | Skip tool availability checks |
-| `--report-mode` | `client` (default) or `internal` (includes AI prompt) |
+| `--report {client,internal}` | Report detail level — `client` (default) or `internal` (includes AI prompt) |
+| `--screenshot-delay SECONDS` | Delay before capturing a screenshot (default: 4.5) |
 | `--presidio` | Enable Presidio PII detection (regex + checksum validators); falls back to regex-only if initialization fails |
 | `--ner` | Enable GLiNER NER backend for ML-based PII detection; exits with error if NER backend fails to initialize |
 
@@ -416,10 +420,12 @@ The generated `.md` report includes:
 
 1. **AI Prompt Header** - feed the report directly into GPT-4 / Claude for risk rating, executive summary, and Jira ticket generation
 2. **Executive Summary** - package name, device info, date, severity breakdown
-3. **Detailed Findings** - per-phase sections with severity, status, and full detail
+3. **Detailed Findings** - per-phase sections with severity, status, a computed **CVSS 3.1** score + vector (context-adjusted and always consistent with each other), and full detail
 4. **Screenshots** - inline Markdown image references
 5. **Command Log** - collapsible section with every command and its output
 6. **Risk Summary Table** - flat table of all findings
+
+A machine-readable `findings_<pkg>_<timestamp>.json` sidecar is written alongside the Markdown report for tooling/automation.
 
 ---
 
@@ -427,30 +433,56 @@ The generated `.md` report includes:
 
 ```
 TrashDroid/
-├── main.py                 # Entry point & phase orchestrator
-├── CHANGELOG.md            # Version history & release notes
-├── requirements.txt            # Base Python dependencies
+├── main.py                     # Entry point, phase orchestrator, per-phase watchdog
+├── pyproject.toml              # Packaging + ruff config (installable, `trashdroid` CLI)
+├── CHANGELOG.md                # Version history & release notes
+├── TESTING.md                  # Automated test + manual device runbook
+├── Dockerfile                  # Container build
+├── requirements.txt            # Base Python dependencies (pinned)
 ├── requirements-presidio.txt   # Optional: Presidio PII detection
 ├── requirements-ner.txt        # Optional: GLiNER NER backend
+├── .github/workflows/ci.yml    # CI: ruff + py_compile + offline test suite
 ├── core/
-│   ├── config.py           # Global state, patterns, flags
-│   ├── adb.py              # ADB command wrapper
-│   ├── drozer.py           # Drozer wrapper (non-interactive)
-│   ├── screenshot.py       # Screenshot capture + scrcpy
-│   └── report.py           # Markdown report generator
+│   ├── config.py               # Global state, patterns, flags, shared constants
+│   ├── adb.py                  # ADB wrapper (validated shell input)
+│   ├── drozer.py               # Drozer wrapper (non-interactive)
+│   ├── screenshot.py           # Screenshot capture + scrcpy
+│   ├── report.py               # Markdown/JSON report generator (CVSS 3.1)
+│   ├── presidio_engine.py      # Presidio/GLiNER PII engine (thread-safe lazy init)
+│   ├── pii_runtime.py          # PII backend startup/warmup
+│   └── runtime_cleanup.py      # Idempotent teardown + partial report
 ├── phases/
-│   ├── preflight.py        # Tool & device checks
-│   ├── setup.py            # Device selection, APK install
-│   ├── drozer_testing.py   # Phase 1 - Drozer tests
-│   ├── filesystem.py       # Phase 3 - File system analysis
-│   ├── dump_verify.py      # Phase 4 - Deep dump verification
-│   ├── logcat.py           # Phase 5 - Logcat monitoring
-│   ├── memory.py           # Phase 6 - Memory analysis
-│   ├── backup.py           # Phase 7 - Backup analysis
-│   ├── manifest.py         # Phase 8 - Manifest analysis
-│   └── post_logout.py      # Phase 9 - Post-logout tests
-└── output/                 # Generated per run (gitignored)
+│   ├── preflight.py            # Tool & device checks
+│   ├── setup.py                # Device selection, APK install
+│   ├── drozer_testing.py       # Phase 1 - Drozer tests
+│   ├── filesystem.py           # Phase 3 - File system analysis
+│   ├── dump_verify.py          # Phase 4 - Deep dump verification
+│   ├── logcat.py               # Phase 5 - Logcat monitoring
+│   ├── memory.py               # Phase 6 - Memory analysis
+│   ├── backup.py               # Phase 7 - Backup analysis
+│   ├── manifest.py             # Phase 8 - Manifest analysis
+│   └── post_logout.py          # Phase 9 - Post-logout tests
+├── utils/
+│   ├── helpers.py              # PII scan helpers + shell-input validators
+│   ├── logcat_collector.py     # Background logcat collector
+│   └── proc.py                 # Shared logcat process start/terminate
+├── tests/                      # unittest suite (run offline; see TESTING.md)
+└── output/                     # Generated per run (gitignored)
 ```
+
+---
+
+## Development & Testing
+
+The test suite runs entirely offline — no device required — and is what CI executes on every push/PR:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+ruff check .                                  # lint (config in pyproject.toml)
+python -m py_compile $(git ls-files '*.py')   # byte-compile gate
+```
+
+Presidio engine tests skip automatically unless `presidio-analyzer` **and** its spaCy model are installed. Everything else always runs. For the manual device-side checklist (drozer, `adb` pull, frida, screenshots), see **[TESTING.md](TESTING.md)**.
 
 ---
 
