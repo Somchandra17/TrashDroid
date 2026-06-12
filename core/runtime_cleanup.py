@@ -4,7 +4,11 @@ Runtime cleanup manager for long-running assessment sessions.
 
 from __future__ import annotations
 
+from rich.console import Console
+
 from core.report import ReportGenerator
+
+console = Console()
 
 
 class RuntimeCleanupManager:
@@ -32,14 +36,14 @@ class RuntimeCleanupManager:
         if self.bg_logcat is not None:
             try:
                 self.bg_logcat.stop()
-            except Exception:
-                pass
+            except (OSError, RuntimeError) as e:
+                console.print(f"[yellow][Cleanup] Failed to stop background logcat: {e}[/yellow]")
 
         if self.screenshotter is not None:
             try:
                 self.screenshotter.stop_scrcpy()
-            except Exception:
-                pass
+            except (OSError, RuntimeError) as e:
+                console.print(f"[yellow][Cleanup] Failed to stop scrcpy: {e}[/yellow]")
 
         if not generate_partial_report or self._final_report_generated:
             return
@@ -48,6 +52,6 @@ class RuntimeCleanupManager:
             try:
                 reporter = ReportGenerator(self.config, self.device_info)
                 path = reporter.generate()
-                print(f"\n[Cleanup] Partial report saved to: {path}")
-            except Exception:
-                pass
+                console.print(f"\n[green][Cleanup] Partial report saved to: {path}[/green]")
+            except (OSError, ValueError) as e:
+                console.print(f"[red][Cleanup] Failed to write partial report: {e}[/red]")

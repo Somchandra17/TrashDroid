@@ -15,15 +15,20 @@ from pathlib import Path
 from rich.console import Console
 from rich.prompt import Confirm
 
-from core.config import Config, SENSITIVE_PATTERNS, TIMING, LIMITS
 from core.adb import ADB
-from utils.helpers import grep_sensitive_lines, presidio_scan_text, presidio_findings_to_report
+from core.config import LIMITS, SENSITIVE_PATTERNS, TIMING, Config
+from utils.helpers import presidio_findings_to_report, presidio_scan_text
 
 console = Console()
 PHASE = "Phase IV — Dump File Verification"
 
 
 def run_dump_verification(config: Config, adb: ADB) -> None:
+    """Phase IV — deep-analyze dumped files (SQLite, shared prefs, binaries, WebView).
+
+    Records findings and command output on `config` and returns None. Failures are
+    handled internally so the orchestrator can continue to the next phase.
+    """
     console.print(f"\n[bold cyan]═══ {PHASE} ═══[/bold cyan]\n")
 
     if not config.auto_mode:
@@ -117,7 +122,7 @@ def _deep_sqlite_analysis(config: Config, db_dir: Path) -> None:
                             ),
                         )
 
-        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        except (subprocess.SubprocessError, OSError) as e:
             console.print(f"  [yellow]Error on {db_file.name}: {e}[/yellow]")
 
 
@@ -250,5 +255,5 @@ def _webview_analysis(config: Config, webview_dir: Path) -> None:
                         if re.search(SENSITIVE_PATTERNS, line, re.IGNORECASE)
                     )[:3000],
                 )
-        except Exception:
-            pass
+        except (OSError, ValueError):
+            continue  # Unreadable/binary WebView file — skip and continue.

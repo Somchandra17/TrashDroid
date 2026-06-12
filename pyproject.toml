@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trashdroid"
+version = "0.1.0"
+description = "Android DAST — automated dynamic VAPT framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+# Presidio PII detection (regex + checksum validators). Enable with --presidio.
+presidio = ["presidio-analyzer>=2.2.35"]
+# GLiNER ML-based NER backend (~560 MB model). Enable with --ner.
+ner = ["presidio-analyzer[gliner]>=2.2.35"]
+
+[project.scripts]
+trashdroid = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["core", "phases", "utils"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# E501 (line length) and E741 (ambiguous single-char names) are intentional style
+# choices in this codebase and not worth churning.
+ignore = ["E501", "E741"]

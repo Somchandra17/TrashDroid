@@ -12,23 +12,32 @@ import time
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
 from rich.table import Table
 
-from core.config import Config
-from core.adb import ADB
+from core.adb import ADB, ADBError
+from core.config import DROZER_AGENT_ACTIVITY, Config
 from core.drozer import Drozer
 from core.screenshot import ScreenshotManager
-from utils.helpers import is_library_component
+from utils.helpers import is_library_component, is_valid_package_name
 
 console = Console()
 PHASE = "Phase IX — Post-Logout Access Control"
 
 
 def run_post_logout_testing(config: Config, adb: ADB, drozer: Drozer, screenshotter: ScreenshotManager) -> None:
+    """Phase IX — re-test exported activities after logout to detect broken access control.
+
+    Records findings and command output on `config` and returns None. Failures are
+    handled internally so the orchestrator can continue to the next phase.
+    """
     console.print(f"\n[bold cyan]═══ {PHASE} ═══[/bold cyan]\n")
 
     pkg = config.package_name
+    if not is_valid_package_name(pkg):
+        console.print(f"[red]Invalid package name '{pkg}'. Skipping post-logout testing.[/red]")
+        config.log_command(PHASE, "validate package", "", f"invalid package name: {pkg}", rc=1)
+        return
 
     if config.auto_mode:
         console.print("[yellow]Auto-mode: clearing app data for post-logout testing...[/yellow]")
@@ -79,9 +88,6 @@ def run_post_logout_testing(config: Config, adb: ADB, drozer: Drozer, screenshot
     _test_direct_activity_access(config, adb, screenshotter, pkg)
 
     console.print(f"\n[green]✓ {PHASE} complete.[/green]")
-
-
-DROZER_AGENT_ACTIVITY = "com.withsecure.dz/.activities.MainActivity"
 
 
 def _ensure_drozer_for_post_logout(config: Config, adb: ADB, drozer: Drozer) -> bool:
@@ -219,7 +225,12 @@ def _test_direct_activity_access(config: Config, adb: ADB, ss: ScreenshotManager
 
     for act, extras in test_cases:
         adb.force_stop(pkg)
-        result = adb.start_activity(pkg, act, extras)
+        try:
+            result = adb.start_activity(pkg, act, extras)
+        except ADBError as e:
+            # Activity name came from dumpsys parsing; skip anything that fails validation.
+            console.print(f"  [yellow]Skipping unsafe activity {act!r}: {e}[/yellow]")
+            continue
         config.log_command(
             PHASE,
             f"adb shell am start -n {pkg}/{act} {extras}".strip(),

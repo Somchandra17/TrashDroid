@@ -15,33 +15,32 @@ import argparse
 import atexit
 import signal
 import sys
+import threading
 import traceback
 from pathlib import Path
 
+from rich.align import Align
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
-from rich.align import Align
 
-
-from core.config import Config, BANNER
 from core.adb import ADB
+from core.config import BANNER, TIMING, Config
 from core.drozer import Drozer
-from core.screenshot import ScreenshotManager
-from core.report import ReportGenerator
 from core.pii_runtime import initialize_pii_detection
+from core.report import ReportGenerator
 from core.runtime_cleanup import RuntimeCleanupManager
-
-from phases.preflight import run_preflight
-from phases.setup import select_device, get_apk_input, install_and_prepare
-from phases.drozer_testing import run_drozer_testing
-from phases.filesystem import run_filesystem_analysis
-from phases.dump_verify import run_dump_verification
-from phases.logcat import run_logcat_monitoring
-from phases.memory import run_memory_analysis
+from core.screenshot import ScreenshotManager
 from phases.backup import run_backup_analysis
+from phases.drozer_testing import run_drozer_testing
+from phases.dump_verify import run_dump_verification
+from phases.filesystem import run_filesystem_analysis
+from phases.logcat import run_logcat_monitoring
 from phases.manifest import run_manifest_analysis
+from phases.memory import run_memory_analysis
 from phases.post_logout import run_post_logout_testing
+from phases.preflight import run_preflight
+from phases.setup import get_apk_input, install_and_prepare, select_device
 
 console = Console()
 
@@ -119,6 +118,51 @@ def parse_args() -> argparse.Namespace:
         help="Enable GLiNER NER backend for ML-based PII detection (implies --presidio, fails fast on init errors)",
     )
     return parser.parse_args()
+
+
+def _execute_phase(phase_runner, phase_name: str, phase_num: int, config: Config, args) -> None:
+    """Run one phase, applying a wall-clock watchdog in --auto mode.
+
+    Interactive runs call the phase directly (they are user-paced). In --auto mode
+    the phase runs in a daemon thread joined with TIMING.phase_budget_sec; if it
+    overruns, the thread is abandoned and a "timed out" finding is recorded so a
+    single wedged adb/drozer/frida call can't hang the whole run. Exceptions raised
+    inside the thread are re-raised on the caller so the existing per-phase
+    error handling still applies.
+    """
+    budget = TIMING.phase_budget_sec
+    if not (getattr(args, "auto", False) and budget and budget > 0):
+        phase_runner()
+        return
+
+    error_holder: dict[str, BaseException] = {}
+
+    def _target() -> None:
+        try:
+            phase_runner()
+        except BaseException as e:  # re-raised on the main thread below
+            error_holder["err"] = e
+
+    worker = threading.Thread(target=_target, name=f"phase-{phase_num}", daemon=True)
+    worker.start()
+    worker.join(timeout=budget)
+
+    if worker.is_alive():
+        console.print(
+            f"[red]Phase {phase_num} exceeded the {budget:.0f}s auto-mode budget — "
+            f"abandoning and continuing.[/red]"
+        )
+        config.add_finding(
+            phase_name,
+            "Phase timed out",
+            "Info",
+            f"Phase {phase_num} exceeded the {budget:.0f}s --auto budget and was abandoned. "
+            "A device/tool call likely hung; re-run this phase individually to investigate.",
+        )
+        return
+
+    if "err" in error_holder:
+        raise error_holder["err"]
 
 
 def main() -> int:
@@ -293,7 +337,7 @@ def main() -> int:
 
         phase_name = ALL_PHASES[phase_num][0]
         try:
-            phase_runners[phase_num]()
+            _execute_phase(phase_runners[phase_num], phase_name, phase_num, config, args)
         except KeyboardInterrupt:
             console.print(f"\n[yellow]Phase {phase_num} interrupted by user.[/yellow]")
             if not args.auto and not Confirm.ask("Continue to next phase?", default=True):
@@ -303,7 +347,7 @@ def main() -> int:
             console.print(f"[dim]{traceback.format_exc()}[/dim]")
             config.add_finding(
                 phase_name,
-                f"Phase execution error",
+                "Phase execution error",
                 "Info",
                 f"Phase {phase_num} encountered an error:\n{traceback.format_exc()}",
             )

@@ -9,15 +9,15 @@ Supports filtering out false-positive library components (androidx.*, google.gms
 from __future__ import annotations
 
 from rich.console import Console
+from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
-from rich.panel import Panel
 
-from core.config import Config
 from core.adb import ADB
+from core.config import DROZER_AGENT_PKG, DROZER_PORT, Config
 from core.drozer import Drozer
 from core.screenshot import ScreenshotManager
-from utils.helpers import is_library_component
+from utils.helpers import is_library_component, is_valid_package_name
 
 console = Console()
 PHASE = "Phase I — Drozer Component Testing"
@@ -44,8 +44,6 @@ def _print_filtered_table(title: str, to_test: list[str], skipped: list[str], co
     console.print(table)
 
 
-DROZER_AGENT_PKG = "com.withsecure.dz"
-DROZER_AGENT_ACTIVITY = "com.withsecure.dz/.activities.MainActivity"
 MAX_DROZER_RETRIES = 3
 
 
@@ -60,7 +58,7 @@ def _ensure_drozer_connected(config: Config, adb: ADB, drozer: Drozer) -> bool:
 
     console.print("[cyan]Setting up Drozer port forwarding...[/cyan]")
     drozer.setup_port_forward()
-    config.log_command(PHASE, "adb forward tcp:31415 tcp:31415", "Port forwarded")
+    config.log_command(PHASE, f"adb forward tcp:{DROZER_PORT} tcp:{DROZER_PORT}", "Port forwarded")
 
     console.print("[cyan]Verifying Drozer connection...[/cyan]")
     if drozer.verify_connection():
@@ -104,13 +102,22 @@ def _ensure_drozer_connected(config: Config, adb: ADB, drozer: Drozer) -> bool:
 
 
 def run_drozer_testing(config: Config, adb: ADB, drozer: Drozer, screenshotter: ScreenshotManager) -> None:
+    """Phase I — test exported components via drozer and capture screenshots.
+
+    Records findings and command output on `config` and returns None. Failures are
+    handled internally so the orchestrator can continue to the next phase.
+    """
     console.print(f"\n[bold cyan]═══ {PHASE} ═══[/bold cyan]\n")
+
+    pkg = config.package_name
+    if not is_valid_package_name(pkg):
+        console.print(f"[red]Invalid package name '{pkg}'. Skipping drozer testing.[/red]")
+        config.log_command(PHASE, "validate package", "", f"invalid package name: {pkg}", rc=1)
+        return
 
     # ── Verify drozer connection (with auto-launch + retry) ──
     if not _ensure_drozer_connected(config, adb, drozer):
         return
-
-    pkg = config.package_name
 
     # ── Attack surface overview ──
     console.print("[cyan]Gathering attack surface...[/cyan]")
@@ -226,9 +233,10 @@ def _test_activities(
 
 
 def _verify_service_running(adb: ADB, pkg: str, svc: str) -> tuple[bool, str]:
-    from core.config import TIMING
     import time
-    
+
+    from core.config import TIMING
+
     svc_short = svc.split(".")[-1]
     running = False
     matched_block: list[str] = []
@@ -245,11 +253,11 @@ def _verify_service_running(adb: ADB, pkg: str, svc: str) -> tuple[bool, str]:
     for _ in range(TIMING.polling_retries):
         time.sleep(1.0)
         result = adb.shell(f"dumpsys activity services {pkg}")
-        
+
         current_block: list[str] = []
         running = False
         matched_block = []
-        
+
         for line in result.stdout.splitlines():
             if "* ServiceRecord{" in line:
                 block_running, block_lines = finalize_block(current_block)
@@ -260,12 +268,12 @@ def _verify_service_running(adb: ADB, pkg: str, svc: str) -> tuple[bool, str]:
                 continue
             if current_block:
                 current_block.append(line)
-                
+
         block_running, block_lines = finalize_block(current_block)
         if block_running:
             running = True
             matched_block = block_lines
-            
+
         if running:
             break
 

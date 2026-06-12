@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -70,8 +71,12 @@ def _downgrade_severity(severity: str) -> str:
 # ── Check if Presidio is available ─────────────────────────────
 _PRESIDIO_AVAILABLE = False
 try:
-    from presidio_analyzer import AnalyzerEngine, RecognizerResult  # noqa: F401
-    from presidio_analyzer import Pattern, PatternRecognizer  # noqa: F401
+    from presidio_analyzer import (  # noqa: F401
+        AnalyzerEngine,
+        Pattern,
+        PatternRecognizer,
+        RecognizerResult,
+    )
     _PRESIDIO_AVAILABLE = True
 except ImportError:
     pass
@@ -87,12 +92,16 @@ class PresidioEngine:
     def __init__(self, use_gliner: bool = False):
         self._use_gliner = use_gliner
         self._analyzer: Optional[object] = None  # AnalyzerEngine once built
+        self._analyzer_lock = threading.Lock()
 
     @property
     def analyzer(self):
-        """Lazily build and return the AnalyzerEngine."""
+        """Lazily build and return the AnalyzerEngine (thread-safe, built once)."""
         if self._analyzer is None:
-            self._analyzer = self._build_analyzer()
+            with self._analyzer_lock:
+                # Double-checked: another thread may have built it while we waited.
+                if self._analyzer is None:
+                    self._analyzer = self._build_analyzer()
         return self._analyzer
 
     def _build_analyzer(self):
@@ -411,10 +420,9 @@ class PresidioEngine:
             return self.analyze_text_for_findings(
                 content, source_label=label, score_threshold=score_threshold
             )
-        except Exception:
+        except (OSError, ValueError):
             # Likely binary — fall back to strings
             try:
-                import subprocess
                 result = subprocess.run(
                     ["strings", str(path)],
                     capture_output=True, text=True, timeout=60,
@@ -422,7 +430,7 @@ class PresidioEngine:
                 return self.analyze_text_for_findings(
                     result.stdout, source_label=label, score_threshold=score_threshold
                 )
-            except Exception:
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
                 return []
 
 

@@ -5,26 +5,17 @@ Setup phase — device selection, APK input, installation, permission grant, log
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Confirm, Prompt
 
-from core.adb import ADB
+from core.adb import ADB, ADBError
 from core.config import Config
+from utils.helpers import is_valid_package_name as _validate_package_name
 
 console = Console()
-
-_PKG_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$')
-
-
-def _validate_package_name(pkg: str) -> bool:
-    """Check if a string looks like a valid Android package name."""
-    if not pkg or ' ' in pkg or len(pkg) < 3:
-        return False
-    return bool(_PKG_RE.match(pkg))
 
 
 def select_device() -> str:
@@ -80,19 +71,35 @@ def get_apk_input(adb: ADB) -> tuple[str | None, str, bool]:
     return apk_path, pkg, False
 
 
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Compute a file's SHA-256 by streaming it in chunks (avoids loading large APKs into memory)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def install_and_prepare(adb: ADB, config: Config) -> None:
     """Install APK, compute hash, prompt for permissions and login."""
     # Compute APK SHA-256 hash for evidence chain-of-custody
     if config.apk_path and Path(config.apk_path).exists():
-        apk_hash = hashlib.sha256(Path(config.apk_path).read_bytes()).hexdigest()
+        apk_hash = _sha256_file(Path(config.apk_path))
         config.apk_hash = apk_hash
         console.print(f"  [dim]APK SHA-256: {apk_hash}[/dim]")
 
     if not config.is_preinstalled and config.apk_path:
         console.print(f"\n[cyan]Installing APK: {config.apk_path}[/cyan]")
-        result = adb.install_apk(config.apk_path)
-        console.print(f"  {result}")
-        config.log_command("Setup", f"adb install -r -d {config.apk_path}", result)
+        try:
+            result = adb.install_apk(config.apk_path)
+        except ADBError as e:
+            console.print(f"  [red]✗ APK installation failed: {e}[/red]")
+            console.print("  [yellow]Continuing setup, but device-side phases may not work "
+                          "until the app is installed manually.[/yellow]")
+            config.log_command("Setup", f"adb install -r -d {config.apk_path}", "", str(e), rc=1)
+        else:
+            console.print(f"  {result}")
+            config.log_command("Setup", f"adb install -r -d {config.apk_path}", result)
 
     if config.auto_mode:
         console.print("[yellow]Auto-mode: skipping permission/login prompts.[/yellow]")

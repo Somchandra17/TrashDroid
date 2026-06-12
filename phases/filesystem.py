@@ -7,25 +7,38 @@ in shared preferences, databases, internal files, cache, and external storage.
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
 from rich.console import Console
-from rich.prompt import Confirm
 
-from core.config import Config, SENSITIVE_PATTERNS
-from core.adb import ADB
-from utils.helpers import grep_sensitive_lines, presidio_scan_text, presidio_findings_to_report
+from core.adb import ADB, ADBError
+from core.config import LIMITS, SENSITIVE_PATTERNS, Config
+from utils.helpers import (
+    grep_sensitive_lines,
+    is_safe_device_path,
+    is_valid_package_name,
+    presidio_findings_to_report,
+    presidio_scan_text,
+)
 
 console = Console()
 PHASE = "Phase III — Local File System Analysis"
 
 
 def run_filesystem_analysis(config: Config, adb: ADB) -> None:
+    """Phase III — pull the app's data directory and scan it for sensitive data.
+
+    Records findings and command output on `config` and returns None. Failures are
+    handled internally so the orchestrator can continue to the next phase.
+    """
     console.print(f"\n[bold cyan]═══ {PHASE} ═══[/bold cyan]\n")
 
     pkg = config.package_name
+    if not is_valid_package_name(pkg):
+        console.print(f"  [red]Refusing to run: '{pkg}' is not a valid package name.[/red]")
+        config.log_command(PHASE, "validate package", "", f"invalid package name: {pkg}", rc=1)
+        return
     device_base = adb.get_app_data_path(pkg)
     local_base = config.output_dir / "filesystem"
     local_base.mkdir(parents=True, exist_ok=True)
@@ -61,11 +74,11 @@ def run_filesystem_analysis(config: Config, adb: ADB) -> None:
             if file_count > 0:
                 console.print(f"    [green]Pulled {file_count} file(s)[/green]")
             else:
-                console.print(f"    [yellow]Directory empty or inaccessible[/yellow]")
+                console.print("    [yellow]Directory empty or inaccessible[/yellow]")
                 # On-device grep fallback for inaccessible directories
                 if rooted:
                     _on_device_grep_fallback(config, adb, remote)
-        except Exception as e:
+        except (ADBError, OSError) as e:
             console.print(f"    [yellow]Could not pull {remote}: {e}[/yellow]")
             config.log_command(PHASE, f"adb pull {remote} {local}", "", str(e))
             # On-device grep fallback when pull fails entirely
@@ -78,7 +91,7 @@ def run_filesystem_analysis(config: Config, adb: ADB) -> None:
         try:
             result = adb.pull(remote, local)
             config.log_command(PHASE, f"adb pull {remote} {local}", result)
-        except Exception as e:
+        except (ADBError, OSError) as e:
             console.print(f"    [yellow]Could not pull {remote}: {e}[/yellow]")
             config.log_command(PHASE, f"adb pull {remote} {local}", "", str(e))
 
@@ -87,6 +100,16 @@ def run_filesystem_analysis(config: Config, adb: ADB) -> None:
     # ── Scan for sensitive data (Presidio or grep fallback) ──
     console.print("\n[cyan]Scanning pulled files for sensitive data...[/cyan]")
     grep_results = _grep_sensitive(str(local_base))
+
+    # Cap the number of matched lines so a pathological target cannot flood the
+    # report / Presidio pass; the full grep output is still written to disk below.
+    _grep_lines = grep_results.splitlines()
+    if len(_grep_lines) > LIMITS.max_grep_lines:
+        console.print(
+            f"  [yellow]grep produced {len(_grep_lines)} lines — capping to "
+            f"{LIMITS.max_grep_lines} for analysis.[/yellow]"
+        )
+        grep_results = "\n".join(_grep_lines[:LIMITS.max_grep_lines])
 
     grep_output_path = config.output_dir / "grep_results.txt"
     grep_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +170,12 @@ def _grep_sensitive(directory: str) -> str:
 
 def _on_device_grep_fallback(config: Config, adb: ADB, remote_path: str) -> None:
     """Run grep directly on the device when local pull is not possible."""
+    # remote_path is interpolated into a root shell command; reject anything
+    # that isn't a plain device path before it can reach `su -c`.
+    if not is_safe_device_path(remote_path):
+        console.print(f"    [yellow]Skipping on-device grep — unsafe path: {remote_path}[/yellow]")
+        config.log_command(PHASE, "on-device grep", "", f"unsafe path rejected: {remote_path}", rc=1)
+        return
     console.print(f"    [cyan]Running on-device grep fallback for {remote_path}...[/cyan]")
     try:
         result = adb.shell(
@@ -175,8 +204,8 @@ def _on_device_grep_fallback(config: Config, adb: ADB, remote_path: str) -> None
                 )
             console.print(f"    [red]On-device grep found {len(lines)} sensitive match(es)[/red]")
         else:
-            console.print(f"    [green]On-device grep: no sensitive data[/green]")
-    except Exception as e:
+            console.print("    [green]On-device grep: no sensitive data[/green]")
+    except (ADBError, OSError, subprocess.SubprocessError) as e:
         console.print(f"    [yellow]On-device grep failed: {e}[/yellow]")
 
 
@@ -246,7 +275,7 @@ def _analyze_databases(config: Config, base_dir: str) -> None:
         except FileNotFoundError:
             console.print("  [yellow]sqlite3 not available — skipping DB analysis.[/yellow]")
             break
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             console.print(f"  [yellow]Error analyzing {db_file.name}: {e}[/yellow]")
 
 
@@ -276,7 +305,7 @@ def _analyze_shared_prefs(config: Config, prefs_dir: str) -> None:
                     fallback_detail=f"File: {xml_file.name}\n\nMatches:\n{grep_sensitive_lines(content)[:3000]}",
                 )
                 console.print(f"    [red]Sensitive data found in {xml_file.name}[/red]")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             console.print(f"  [yellow]Error reading {xml_file.name}: {e}[/yellow]")
 
 
@@ -287,9 +316,21 @@ def _analyze_nosql(config: Config, adb: ADB, pkg: str, base_dir: str) -> None:
     found_files: list[Path] = []
     base = Path(base_dir)
     for ext in extensions:
-        found_files.extend(base.rglob(ext))
+        for match in base.rglob(ext):
+            found_files.append(match)
+            if len(found_files) >= LIMITS.max_scan_files:
+                console.print(
+                    f"  [yellow]Reached scan cap ({LIMITS.max_scan_files} files) — "
+                    f"stopping NoSQL enumeration.[/yellow]"
+                )
+                break
+        if len(found_files) >= LIMITS.max_scan_files:
+            break
 
     if not found_files:
+        if not is_valid_package_name(pkg):
+            console.print(f"  [yellow]Skipping on-device NoSQL search — invalid package: {pkg}[/yellow]")
+            return
         # Try finding on device
         result = adb.shell(f"find /data/data/{pkg} -name '*.realm' -o -name '*.json' -o -name '*.bson' 2>/dev/null", root=True)
         config.log_command(PHASE, f"find /data/data/{pkg} -name '*.realm' ...", result.stdout)
@@ -319,6 +360,10 @@ def _analyze_nosql(config: Config, adb: ADB, pkg: str, base_dir: str) -> None:
 
 def _check_file_permissions(config: Config, adb: ADB, pkg: str) -> None:
     console.print("\n[cyan]Checking file permissions...[/cyan]")
+
+    if not is_valid_package_name(pkg):
+        console.print(f"  [yellow]Skipping permission check — invalid package: {pkg}[/yellow]")
+        return
 
     # World-readable files
     result = adb.shell(
@@ -353,7 +398,7 @@ def _analyze_keystores(config: Config, base_dir: str) -> None:
     keystores = []
     for ext in ["*.jks", "*.bks", "*.keystore"]:
         keystores.extend(base.rglob(ext))
-    
+
     if keystores:
         paths = "\n".join(str(k) for k in keystores)
         config.add_finding(

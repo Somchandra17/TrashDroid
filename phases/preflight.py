@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.table import Table
 
-from typing import TYPE_CHECKING
-from core.config import REQUIRED_TOOLS
+from core.config import DROZER_AGENT_PKG, REQUIRED_TOOLS
 
 if TYPE_CHECKING:
     from core.adb import ADB
@@ -32,21 +32,21 @@ def check_tool_version(name: str) -> str:
             output = (result.stdout or result.stderr).strip()
             if output and "unknown command" not in output.lower():
                 return output.splitlines()[0][:80]
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             continue
     return "installed"
 
 
 def verify_device_prerequisites(adb: ADB) -> bool:
     """Check if necessary components like Drozer are installed on the device itself."""
-    drozer_pkg = "com.withsecure.dz"
+    drozer_pkg = DROZER_AGENT_PKG
     console.print("\n[cyan]Checking on-device prerequisites...[/cyan]")
-    
+
     while not adb.is_package_installed(drozer_pkg):
         console.print(f"\n[red]✗ Drozer Agent ({drozer_pkg}) is not installed on the device.[/red]")
         console.print("Please install the Drozer Agent APK on the device using:")
         console.print("[white]adb install path/to/drozer-agent.apk[/white]")
-        
+
         from rich.prompt import Prompt
         ans = Prompt.ask("Have you installed it now? (y/n/skip)", choices=["y", "n", "skip"], default="y")
         if ans == "skip":
@@ -55,7 +55,7 @@ def verify_device_prerequisites(adb: ADB) -> bool:
         elif ans == "n":
             console.print("[red]Aborting due to missing on-device prerequisites.[/red]")
             return False
-            
+
     console.print("[green]✓ Drozer Agent is installed on the device.[/green]")
     return True
 
@@ -129,8 +129,8 @@ def run_preflight() -> bool:
                     console.print(
                         f"\n[yellow]⚠ Device '{parts[0]}' is offline. Reconnect the USB cable.[/yellow]"
                     )
-    except Exception:
-        pass
+    except (subprocess.SubprocessError, OSError):
+        pass  # Diagnostic-only listing; ignore if `adb devices` can't be run.
 
     if not devices:
         console.print("\n[red bold]✗ No authorized Android device detected via ADB.[/red bold]")

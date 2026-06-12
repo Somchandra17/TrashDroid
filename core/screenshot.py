@@ -36,6 +36,15 @@ class ScreenshotManager:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            # Give scrcpy a moment to fail fast (e.g. device offline) before assuming it is live.
+            time.sleep(1.0)
+            if self._scrcpy_proc.poll() is not None:
+                console.print(
+                    f"[yellow]  scrcpy exited immediately (code "
+                    f"{self._scrcpy_proc.returncode}) — live mirroring unavailable[/yellow]"
+                )
+                self._scrcpy_proc = None
+                return
             console.print("[green]  scrcpy launched for live device mirroring[/green]")
         except FileNotFoundError:
             console.print("[yellow]  scrcpy not found — live mirroring unavailable[/yellow]")

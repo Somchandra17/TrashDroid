@@ -15,9 +15,10 @@ import time
 from rich.console import Console
 from rich.panel import Panel
 
-from core.config import Config, SENSITIVE_PATTERNS
 from core.adb import ADB
-from utils.helpers import presidio_scan_text, presidio_findings_to_report
+from core.config import SENSITIVE_PATTERNS, Config
+from utils.helpers import presidio_findings_to_report, presidio_scan_text
+from utils.proc import start_logcat_process, terminate_process
 
 console = Console()
 PHASE = "Phase V — Logcat Monitoring"
@@ -31,8 +32,19 @@ NOISE_TAGS = (
     "Launcher3",
 )
 
+# Endpoints that suggest auth/API traffic leaking through logs (compiled once).
+_SENSITIVE_ENDPOINT_RE = re.compile(
+    r"/(api|auth|login|logout|token|oauth|v[0-9]+/users|graphql|signup|register|password|session)",
+    re.IGNORECASE,
+)
+
 
 def run_logcat_monitoring(config: Config, adb: ADB) -> None:
+    """Phase V — capture logcat while the app runs and scan for leaked sensitive data.
+
+    Records findings and command output on `config` and returns None. Failures are
+    handled internally so the orchestrator can continue to the next phase.
+    """
     console.print(f"\n[bold cyan]═══ {PHASE} ═══[/bold cyan]\n")
 
     pkg = config.package_name
@@ -70,30 +82,12 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
             return proc_holder["proc"]
 
     def _terminate_capture_process() -> None:
-        proc = _get_proc()
-        if proc is None:
-            return
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=2)
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        terminate_process(_get_proc())
         _set_proc(None)
 
     def _capture_logcat():
-        cmd = ["adb"]
-        if adb.device_id:
-            cmd += ["-s", adb.device_id]
-        cmd += ["logcat", "-v", "threadtime"]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc = start_logcat_process(adb.device_id)
             _set_proc(proc)
             start = time.time()
             while not stop_event.is_set():
@@ -107,7 +101,7 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
                 if time.time() - start > auto_timeout:
                     stop_event.set()
                     break
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             log_lines.append(f"[ERROR] Logcat capture failed: {e}\n")
         finally:
             _terminate_capture_process()
@@ -121,6 +115,10 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
         input_event = threading.Event()
 
         def _wait_for_input():
+            # Blocks on stdin until the user presses Enter. If the auto timeout
+            # fires first, this thread is intentionally left blocked on input();
+            # it is a daemon so it is abandoned at process exit. The capture
+            # process is torn down unconditionally below regardless of this thread.
             input()
             input_event.set()
 
@@ -205,7 +203,6 @@ def run_logcat_monitoring(config: Config, adb: ADB) -> None:
 def _scan_for_http(config: Config, logs: str) -> None:
     http_lines = [l for l in logs.splitlines() if re.search(r"https?://", l, re.IGNORECASE)]
     if http_lines:
-        http_text = "\n".join(http_lines[:100])
         cleartext_http = [l for l in http_lines if "http://" in l.lower()]
         if cleartext_http:
             config.add_finding(
@@ -216,10 +213,7 @@ def _scan_for_http(config: Config, logs: str) -> None:
             )
 
         # Flag sensitive API endpoints
-        sensitive_endpoint_patterns = re.compile(
-            r"/(api|auth|login|logout|token|oauth|v[0-9]+/users|graphql|signup|register|password|session)", re.IGNORECASE
-        )
-        sensitive_lines = [l for l in http_lines if sensitive_endpoint_patterns.search(l)]
+        sensitive_lines = [l for l in http_lines if _SENSITIVE_ENDPOINT_RE.search(l)]
         if sensitive_lines:
             config.add_finding(
                 PHASE,

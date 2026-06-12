@@ -4,12 +4,10 @@ Global configuration and shared state for the Android DAST framework.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-
 
 SENSITIVE_PATTERNS = (
     r"password|passwd|pwd"
@@ -87,6 +85,9 @@ class Timing:
     db_query_timeout: int = 120
     polling_retries: int = 3
     file_pull_timeout: int = 300
+    # Max wall-clock seconds a single phase may run in --auto mode before the
+    # orchestrator abandons it and moves on (0 disables the watchdog).
+    phase_budget_sec: float = 600.0
 
 
 @dataclass
@@ -95,10 +96,28 @@ class Limits:
     binary_file_scan_limit: int = 50 * 1024 * 1024
     max_binary_files: int = 500
     max_logcat_lines: int = 50000
+    # Cap directory enumeration so a huge target tree cannot hang/OOM a scan.
+    max_scan_files: int = 5000
+    # Cap lines kept from a single grep result before truncating.
+    max_grep_lines: int = 2000
+    # Wall-clock budget (seconds) for source enumeration scans (e.g. smali).
+    source_scan_budget_sec: float = 60.0
+    # Largest single file (bytes) read whole into memory (e.g. backup.ab, memory dumps).
+    max_in_memory_read: int = 512 * 1024 * 1024
 
 
 TIMING = Timing()
 LIMITS = Limits()
+
+
+# ── On-device agent / tooling locations (shared across phases) ──
+# drozer agent package + launchable activity (WithSecure agent app).
+DROZER_AGENT_PKG = "com.withsecure.dz"
+DROZER_AGENT_ACTIVITY = "com.withsecure.dz/.activities.MainActivity"
+# TCP port drozer forwards between host and on-device agent.
+DROZER_PORT = 31415
+# Default on-device frida-server path.
+FRIDA_SERVER_PATH = "/data/local/tmp/frida-server"
 
 
 @dataclass

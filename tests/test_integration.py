@@ -7,22 +7,19 @@ the Presidio-aware scanning interface used by all phases.
 
 from __future__ import annotations
 
-import unittest
-from unittest.mock import MagicMock, patch
-from dataclasses import dataclass, field
-
-import sys
 import os
+import sys
+import unittest
+from unittest.mock import MagicMock
 
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from utils.helpers import (
     grep_sensitive_lines,
-    presidio_scan_text,
-    presidio_scan_file,
-    presidio_findings_to_report,
     is_library_component,
+    presidio_findings_to_report,
+    presidio_scan_text,
 )
 
 
@@ -172,15 +169,23 @@ class TestPresidioFindingsToReport(unittest.TestCase):
         self.assertEqual(severity, "High")
 
 
-# Only run Presidio-specific tests if the package is available
-try:
-    import presidio_analyzer
-    PRESIDIO_AVAILABLE = True
-except ImportError:
-    PRESIDIO_AVAILABLE = False
+# Only run Presidio-specific tests if the engine can actually be built. Importing
+# the package isn't enough: Presidio's spaCy backend may try to download a model
+# and call sys.exit() (SystemExit, not ImportError) when it's absent — so we catch
+# BaseException and skip cleanly offline/in CI rather than erroring the suite.
+def _presidio_engine_buildable() -> bool:
+    try:
+        from core.presidio_engine import PresidioEngine
+        PresidioEngine().analyzer  # forces lazy build
+        return True
+    except BaseException:
+        return False
 
 
-@unittest.skipUnless(PRESIDIO_AVAILABLE, "presidio-analyzer not installed")
+PRESIDIO_AVAILABLE = _presidio_engine_buildable()
+
+
+@unittest.skipUnless(PRESIDIO_AVAILABLE, "presidio engine unavailable (package or spaCy model missing)")
 class TestPresidioScanTextWithEngine(unittest.TestCase):
     """Tests with actual Presidio engine attached to config."""
 

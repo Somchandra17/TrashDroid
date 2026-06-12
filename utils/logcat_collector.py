@@ -12,7 +12,8 @@ import subprocess
 import threading
 from pathlib import Path
 
-from core.config import SENSITIVE_PATTERNS
+from core.config import LIMITS, SENSITIVE_PATTERNS
+from utils.proc import start_logcat_process, terminate_process
 
 
 class BackgroundLogcatCollector:
@@ -58,34 +59,12 @@ class BackgroundLogcatCollector:
             self._proc = proc
 
     def _terminate_process(self, force_kill: bool) -> None:
-        proc = self._get_process()
-        if proc is None:
-            return
-
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                if force_kill:
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
+        terminate_process(self._get_process(), force_kill=force_kill)
         self._set_process(None)
 
     def _capture_loop(self) -> None:
-        cmd = ["adb"]
-        if self.device_id:
-            cmd += ["-s", self.device_id]
-        cmd += ["logcat", "-v", "threadtime"]
-
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc = start_logcat_process(self.device_id)
             self._set_process(proc)
             while not self._stop_event.is_set():
                 if proc.stdout is None:
@@ -95,11 +74,11 @@ class BackgroundLogcatCollector:
                     # Only capture app-related lines to keep memory bounded
                     if self.package_name in line:
                         self._lines.append(line)
-                    # Cap at 50k lines to prevent memory issues
-                    if len(self._lines) >= 50000:
+                    # Cap line count to keep memory bounded.
+                    if len(self._lines) >= LIMITS.max_logcat_lines:
                         break
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError):
+            pass  # Capture stream closed/failed — saved lines are still usable.
         finally:
             self._terminate_process(force_kill=True)
 

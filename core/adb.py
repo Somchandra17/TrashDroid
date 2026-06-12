@@ -11,11 +11,25 @@ from typing import Optional
 
 from rich.console import Console
 
+from utils.helpers import is_safe_device_path, is_valid_component_name, is_valid_package_name
+
 console = Console()
 
 
 class ADBError(Exception):
     pass
+
+
+def _require_package(package: str) -> None:
+    """Reject a package name that isn't safe to interpolate into a shell command."""
+    if not is_valid_package_name(package):
+        raise ADBError(f"Refusing to use invalid package name in shell command: {package!r}")
+
+
+def _require_device_path(path: str) -> None:
+    """Reject a device path that isn't safe to interpolate into a shell command."""
+    if not is_safe_device_path(path):
+        raise ADBError(f"Refusing to use unsafe device path in shell command: {path!r}")
 
 
 class ADB:
@@ -29,7 +43,7 @@ class ADB:
 
     def run(self, args: list[str], timeout: int = 60, check: bool = False, retries: int = 2) -> subprocess.CompletedProcess:
         cmd = self._base_cmd() + args
-        
+
         for attempt in range(1 + retries):
             try:
                 result = subprocess.run(
@@ -41,11 +55,19 @@ class ADB:
                 if check and result.returncode != 0:
                     raise ADBError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
                 return result
+            except FileNotFoundError as e:
+                # adb itself is missing — retrying will not help.
+                raise ADBError("adb executable not found — is the Android platform-tools "
+                               "directory on your PATH?") from e
             except (subprocess.TimeoutExpired, ADBError) as e:
                 if attempt < retries:
                     time.sleep(attempt + 1)
                     continue
                 raise ADBError(f"Command failed after {retries + 1} attempts: {' '.join(cmd)}") from e
+
+        # Unreachable in practice (the loop always returns or raises), but keeps a
+        # single exception type for callers instead of an implicit None return.
+        raise ADBError(f"Command did not run: {' '.join(cmd)}")
 
     def shell(self, cmd: str, root: bool = False, timeout: int = 60) -> subprocess.CompletedProcess:
         if root:
@@ -110,10 +132,12 @@ class ADB:
         return None
 
     def is_package_installed(self, package: str) -> bool:
+        _require_package(package)
         result = self.shell(f"pm list packages {package}")
         return f"package:{package}" in result.stdout
 
     def get_pid(self, package: str) -> Optional[str]:
+        _require_package(package)
         result = self.shell(f"pidof {package}")
         pid = result.stdout.strip()
         return pid if pid else None
@@ -132,6 +156,7 @@ class ADB:
         Falls back to normal pull if su staging fails.
         """
         import uuid
+        _require_device_path(remote)
         staging = f"/data/local/tmp/dast_stage_{uuid.uuid4().hex[:8]}"
         try:
             self.shell(f"mkdir -p {staging}", root=True)
@@ -139,7 +164,7 @@ class ADB:
             self.shell(f"chmod -R 777 {staging}", root=True)
 
             if cp_result.returncode != 0:
-                console.print(f"  [yellow]Root copy failed, trying regular pull...[/yellow]")
+                console.print("  [yellow]Root copy failed, trying regular pull...[/yellow]")
                 return self.pull(remote, local)
 
             result = self.run(["pull", f"{staging}/", local], timeout=120)
@@ -148,17 +173,23 @@ class ADB:
             self.shell(f"rm -rf {staging}", root=True)
 
     def launch_app(self, package: str) -> str:
+        _require_package(package)
         result = self.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
         return result.stdout.strip()
 
     def clear_app_data(self, package: str) -> str:
+        _require_package(package)
         result = self.shell(f"pm clear {package}")
         return result.stdout.strip()
 
     def force_stop(self, package: str) -> None:
+        _require_package(package)
         self.shell(f"am force-stop {package}")
 
     def start_activity(self, package: str, activity: str, extras: str = "") -> str:
+        _require_package(package)
+        if not is_valid_component_name(activity):
+            raise ADBError(f"Refusing to start invalid activity component: {activity!r}")
         cmd = f"am start -n {package}/{activity}"
         if extras:
             cmd += f" {extras}"
@@ -199,8 +230,10 @@ class ADB:
         self.run(["logcat", "-c"])
 
     def get_app_data_path(self, package: str) -> str:
+        _require_package(package)
         return f"/data/data/{package}"
 
     def list_dir(self, path: str, root: bool = True) -> list[str]:
+        _require_device_path(path)
         output = self.shell_output(f"ls -la {path}", root=root)
         return output.splitlines()

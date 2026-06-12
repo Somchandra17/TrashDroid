@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install base + dev tools
+        run: |
+          python -m pip install --upgrade pip
+          # Base runtime deps only — Presidio/GLiNER are optional and their
+          # engine tests skip themselves when the model isn't installed.
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Byte-compile all sources
+        run: python -m py_compile $(git ls-files '*.py')
+
+      - name: Run test suite (offline)
+        run: python -m unittest discover -s tests -p "test_*.py" -v

@@ -3,12 +3,46 @@ Markdown report generator: compiles all phase findings into a single .md report.
 """
 
 from __future__ import annotations
+
 import json
 import re
 from datetime import datetime
-from pathlib import Path
 
 from core.config import Config
+
+
+def _md_cell(text: str) -> str:
+    """Make a string safe for a Markdown table cell / single-line context.
+
+    Escapes pipes (column separators) and collapses newlines to spaces so a
+    finding title/value can't break table layout or headings.
+    """
+    return str(text).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _fence(content: str) -> str:
+    """Return a backtick fence guaranteed longer than any backtick run in content.
+
+    CommonMark allows fences of arbitrary length; using one longer than the
+    longest internal run prevents the content from closing the block early.
+    """
+    longest = 0
+    run = 0
+    for ch in content:
+        if ch == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return "`" * max(3, longest + 1)
+
+
+def _md_image(caption: str, path: str) -> str:
+    """Build a Markdown image that survives special chars in the caption/path."""
+    alt = str(caption).replace("[", "\\[").replace("]", "\\]").replace("\n", " ").strip()
+    # Angle-bracket form tolerates spaces and parentheses in the path.
+    safe_path = str(path).replace("<", "%3C").replace(">", "%3E")
+    return f"![{alt}](<{safe_path}>)"
 
 
 AI_PROMPT = """You are a senior mobile security engineer. Review the following Android DAST findings,
@@ -27,38 +61,94 @@ EXPECTED_PHASES = [
     "Phase IX — Post-Logout Access Control",
 ]
 
-CVSS_BY_SEVERITY = {
-    "Critical": ("9.0", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
-    "High": ("8.0", "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:L"),
-    "Medium": ("5.5", "CVSS:3.1/AV:L/AC:L/PR:L/UI:R/S:U/C:L/I:L/A:N"),
-    "Low": ("3.1", "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N"),
-    "Info": ("0.0", "N/A"),
+# Base CVSS 3.1 metrics per severity bucket. The numeric score is computed from
+# these (see _cvss31_base_score) so the score and vector can never disagree.
+# Metric order follows the canonical CVSS:3.1 vector string.
+_METRIC_ORDER = ("AV", "AC", "PR", "UI", "S", "C", "I", "A")
+_BASE_METRICS_BY_SEVERITY: dict[str, dict[str, str]] = {
+    "Critical": {"AV": "N", "AC": "L", "PR": "N", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "H"},
+    "High":     {"AV": "N", "AC": "L", "PR": "L", "UI": "N", "S": "U", "C": "H", "I": "H", "A": "L"},
+    "Medium":   {"AV": "N", "AC": "L", "PR": "L", "UI": "R", "S": "U", "C": "L", "I": "L", "A": "N"},
+    "Low":      {"AV": "N", "AC": "H", "PR": "L", "UI": "R", "S": "U", "C": "L", "I": "N", "A": "N"},
+}
+
+# CVSS 3.1 metric weights.
+_CVSS_WEIGHTS = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "UI": {"N": 0.85, "R": 0.62},
+    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+# Privileges Required weight depends on Scope.
+_PR_WEIGHTS = {
+    "U": {"N": 0.85, "L": 0.62, "H": 0.27},
+    "C": {"N": 0.85, "L": 0.68, "H": 0.5},
 }
 
 
+def _cvss31_roundup(value: float) -> float:
+    """Official CVSS 3.1 roundup: smallest one-decimal number >= value (integer-math safe)."""
+    int_input = round(value * 100000)
+    if int_input % 10000 == 0:
+        return int_input / 100000.0
+    return (int_input // 10000 + 1) / 10.0
+
+
+def _cvss31_base_score(metrics: dict[str, str]) -> float:
+    """Compute the CVSS 3.1 base score from a metrics dict (AV/AC/PR/UI/S/C/I/A)."""
+    scope = metrics["S"]
+    iss = 1 - (
+        (1 - _CVSS_WEIGHTS["C"][metrics["C"]])
+        * (1 - _CVSS_WEIGHTS["I"][metrics["I"]])
+        * (1 - _CVSS_WEIGHTS["A"][metrics["A"]])
+    )
+    if scope == "U":
+        impact = 6.42 * iss
+    else:
+        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+
+    exploitability = (
+        8.22
+        * _CVSS_WEIGHTS["AV"][metrics["AV"]]
+        * _CVSS_WEIGHTS["AC"][metrics["AC"]]
+        * _PR_WEIGHTS[scope][metrics["PR"]]
+        * _CVSS_WEIGHTS["UI"][metrics["UI"]]
+    )
+
+    if impact <= 0:
+        return 0.0
+    if scope == "U":
+        return _cvss31_roundup(min(impact + exploitability, 10))
+    return _cvss31_roundup(min(1.08 * (impact + exploitability), 10))
+
+
 def _contextual_cvss(severity: str, title: str, detail: str) -> tuple[str, str]:
-    """Derive context-aware CVSS vector based on finding type, not just severity."""
+    """Derive a context-aware CVSS 3.1 vector and a score computed from that vector.
+
+    The Attack Vector is adjusted by finding type; the score is always recomputed
+    from the final metrics so the two can never disagree.
+    """
+    if severity not in _BASE_METRICS_BY_SEVERITY:
+        return "0.0", "N/A"
+
     text = f"{title}\n{detail}".lower()
-    base_score, base_vector = CVSS_BY_SEVERITY.get(severity, ("0.0", "N/A"))
+    metrics = dict(_BASE_METRICS_BY_SEVERITY[severity])
 
-    if severity == "Info" or base_vector == "N/A":
-        return base_score, base_vector
-
-    # Adjust Attack Vector based on finding context
+    # Adjust Attack Vector based on finding context.
     if any(kw in text for kw in ["backup", "usb", "physical"]):
-        # Physical access required
-        return base_score, base_vector.replace("AV:N", "AV:P")
-    if any(kw in text for kw in ["exported", "component", "activity accessible", "post-logout", "intent"]):
-        # Local attack — requires app on same device
-        return base_score, base_vector.replace("AV:N", "AV:L")
-    if any(kw in text for kw in ["cleartext", "http://", "network", "mitm"]):
-        # Network-based attack
-        return base_score, base_vector  # Already AV:N
-    if any(kw in text for kw in ["sql injection", "path traversal", "content provider"]):
-        # Network if exposed via deep link, otherwise local
-        return base_score, base_vector.replace("AV:N", "AV:L")
+        metrics["AV"] = "P"  # Physical access required
+    elif any(kw in text for kw in ["exported", "component", "activity accessible", "post-logout", "intent"]):
+        metrics["AV"] = "L"  # Local — requires code on the same device
+    elif any(kw in text for kw in ["cleartext", "http://", "network", "mitm"]):
+        metrics["AV"] = "N"  # Network-based
+    elif any(kw in text for kw in ["sql injection", "path traversal", "content provider"]):
+        metrics["AV"] = "L"  # Local unless exposed via deep link
 
-    return base_score, base_vector
+    vector = "CVSS:3.1/" + "/".join(f"{m}:{metrics[m]}" for m in _METRIC_ORDER)
+    score = _cvss31_base_score(metrics)
+    return f"{score:.1f}", vector
 
 
 def _dedupe_findings(config: Config) -> dict[str, list[dict]]:
@@ -258,16 +348,40 @@ def _normalize_detail(phase_name: str, finding: dict, commands_log: list[dict]) 
     return detail
 
 
+def _target_match_tokens(target: str) -> tuple[str, list[str]]:
+    """Break a finding target into a full lowercased form plus match tokens.
+
+    Returns (full, tokens) where `full` is the whole lowercased target and
+    `tokens` are its alphanumeric segments (len > 2), with the last dotted
+    segment — the short class name — included as a strong-match token.
+    """
+    full = target.lower().strip()
+    if not full:
+        return "", []
+    tokens = {seg for seg in re.split(r"[^a-z0-9]+", full) if len(seg) > 2}
+    # Short class/component name (last dotted segment), e.g. com.x.MyService -> myservice
+    dotted = [seg for seg in full.split(".") if seg]
+    if dotted:
+        short = re.sub(r"[^a-z0-9]+", "", dotted[-1])
+        if len(short) > 2:
+            tokens.add(short)
+    return full, sorted(tokens)
+
+
 def _screenshots_for_finding(
     screenshots: list[dict],
     phase_name: str,
     finding: dict,
     used_paths: set[str],
 ) -> list[dict]:
-    """Strict screenshot matching: require target/component-level match first."""
+    """Match screenshots to a finding by target tokens, with keyword fallbacks.
+
+    Precise but not all-or-nothing: a finding with a clear target prefers
+    captions that mention it, but still falls back to keyword/long-token scoring
+    so findings with generic captions (e.g. providers) keep their evidence.
+    """
     title = finding["title"].lower()
-    target = _extract_target_from_title(finding["title"]).lower()
-    detail = finding["detail"].lower()
+    full_target, target_tokens = _target_match_tokens(_extract_target_from_title(finding["title"]))
 
     candidates: list[tuple[int, dict]] = []
     for ss in screenshots:
@@ -275,11 +389,10 @@ def _screenshots_for_finding(
             continue
         caption = ss["caption"].lower()
         score = 0
-        if target and target in caption:
+        if full_target and full_target in caption:
             score += 10
-        elif target:
-            # strict mode: if finding has a clear target, do not map generic same-phase screenshots
-            continue
+        if any(tok in caption for tok in target_tokens):
+            score += 6
         if "activity" in title and "activity" in caption:
             score += 2
         if "service" in title and "service" in caption:
@@ -291,8 +404,6 @@ def _screenshots_for_finding(
         for token in title.split():
             if len(token) > 10 and token in caption:
                 score += 1
-        if score > 0 and (caption in detail or target in detail or target in caption):
-            score += 1
         if score > 0:
             candidates.append((score, ss))
 
@@ -426,7 +537,7 @@ class ReportGenerator:
             sections.append("|-------------|-------|------------------|----------------|")
             for etype, info in sorted(pii_entities.items(), key=lambda x: x[1]["count"], reverse=True):
                 avg_conf = sum(info["scores"]) / len(info["scores"]) if info["scores"] else 0.0
-                sections.append(f"| {etype} | {info['count']} | {info['severity']} | {avg_conf:.2f} |")
+                sections.append(f"| {_md_cell(etype)} | {info['count']} | {info['severity']} | {avg_conf:.2f} |")
             sections.append("")
 
         # ── Per-phase findings ──
@@ -448,7 +559,7 @@ class ReportGenerator:
                     remediation = _remediation_for_finding(f["title"], normalized_detail)
                     impact = _business_impact_for_finding(f["title"], normalized_detail)
 
-                    sections.append(f"#### {i}. {f['title']}\n")
+                    sections.append(f"#### {i}. {_md_cell(f['title'])}\n")
                     sections.append(f"- **Severity:** {f['severity']}")
                     sections.append(f"- **Status:** {f['status']}")
                     sections.append(f"- **Confidence:** {confidence}")
@@ -460,17 +571,20 @@ class ReportGenerator:
                         sections.append(f"- **Occurrences merged:** {f['occurrences']}")
                     sections.append(f"- **Business Impact:** {impact}")
                     sections.append(f"- **Remediation:** {remediation}")
-                    sections.append(f"- **Detail:**\n")
+                    sections.append("- **Detail:**\n")
                     detail_text = normalized_detail
                     total_len = len(detail_text)
                     if total_len > 3000:
                         detail_text = detail_text[:3000] + f"\n\n[... truncated — {total_len - 3000} more characters omitted ...]"
-                    sections.append(f"```\n{detail_text}\n```\n")
+                    dfence = _fence(detail_text)
+                    sections.append(f"{dfence}\n{detail_text}\n{dfence}\n")
                     if f["severity"] in {"High", "Critical"}:
                         sections.append("- **Jira Draft:**")
-                        sections.append("```")
-                        sections.append(_jira_block(phase_name, f, cvss_score, remediation, normalized_detail))
-                        sections.append("```\n")
+                        jira_text = _jira_block(phase_name, f, cvss_score, remediation, normalized_detail)
+                        jfence = _fence(jira_text)
+                        sections.append(jfence)
+                        sections.append(jira_text)
+                        sections.append(f"{jfence}\n")
 
                     matched_screenshots = _screenshots_for_finding(
                         c.screenshots,
@@ -481,8 +595,8 @@ class ReportGenerator:
                     if matched_screenshots:
                         sections.append("- **Screenshots (evidence):**")
                         for ss in matched_screenshots:
-                            sections.append(f"  - {ss['caption']}")
-                            sections.append(f"![{ss['caption']}]({ss['path']})")
+                            sections.append(f"  - {_md_cell(ss['caption'])}")
+                            sections.append(_md_image(ss['caption'], ss['path']))
                         sections.append("")
 
             # Keep any unmatched screenshots in the same phase section (no global screenshot section).
@@ -493,8 +607,8 @@ class ReportGenerator:
             if phase_unmapped:
                 sections.append("**Additional evidence captured in this phase:**")
                 for ss in phase_unmapped:
-                    sections.append(f"- {ss['caption']}")
-                    sections.append(f"![{ss['caption']}]({ss['path']})")
+                    sections.append(f"- {_md_cell(ss['caption'])}")
+                    sections.append(_md_image(ss['caption'], ss['path']))
                     used_screenshot_paths.add(ss["path"])
                 sections.append("")
 
@@ -512,14 +626,19 @@ class ReportGenerator:
         sections.append("---\n## Commands Executed\n")
         sections.append("<details><summary>Click to expand full command log</summary>\n")
         for entry in c.commands_log:
-            sections.append(f"**Phase:** {entry['phase']}  ")
-            sections.append(f"```bash\n$ {entry['cmd']}\n```")
+            sections.append(f"**Phase:** {_md_cell(entry['phase'])}  ")
+            cmd_text = f"$ {entry['cmd']}"
+            cfence = _fence(cmd_text)
+            sections.append(f"{cfence}bash\n{cmd_text}\n{cfence}")
             sections.append(f"- rc: `{entry.get('rc', 0)}`")
             if entry["stdout"]:
                 stdout_trimmed = entry["stdout"][:2000]
-                sections.append(f"```\n{stdout_trimmed}\n```")
+                ofence = _fence(stdout_trimmed)
+                sections.append(f"{ofence}\n{stdout_trimmed}\n{ofence}")
             if entry["stderr"]:
-                sections.append(f"**stderr:**\n```\n{entry['stderr'][:1000]}\n```")
+                stderr_trimmed = entry["stderr"][:1000]
+                efence = _fence(stderr_trimmed)
+                sections.append(f"**stderr:**\n{efence}\n{stderr_trimmed}\n{efence}")
             sections.append("")
         sections.append("</details>\n")
 
@@ -534,7 +653,7 @@ class ReportGenerator:
                 confidence = _confidence_for_finding(f["title"], normalized_detail)
                 confidence_cell = "**CONFIRMED**" if confidence == "Confirmed" else confidence
                 sections.append(
-                    f"| {idx} | {f['title']} | {phase_name} | {f['severity']} | {f['status']} | {confidence_cell} |"
+                    f"| {idx} | {_md_cell(f['title'])} | {_md_cell(phase_name)} | {f['severity']} | {f['status']} | {confidence_cell} |"
                 )
                 idx += 1
         sections.append("")

@@ -6,7 +6,6 @@ Creates an ADB backup, extracts it, and scans for sensitive data.
 
 from __future__ import annotations
 
-import re
 import subprocess
 import zlib
 from pathlib import Path
@@ -14,15 +13,20 @@ from pathlib import Path
 from rich.console import Console
 from rich.prompt import Confirm
 
-from core.config import Config, SENSITIVE_PATTERNS
 from core.adb import ADB
-from utils.helpers import presidio_scan_text, presidio_findings_to_report
+from core.config import LIMITS, SENSITIVE_PATTERNS, Config
+from utils.helpers import presidio_findings_to_report, presidio_scan_text
 
 console = Console()
 PHASE = "Phase VII — ADB Backup Analysis"
 
 
 def run_backup_analysis(config: Config, adb: ADB) -> None:
+    """Phase VII — create an ADB backup, extract it, and scan the contents for sensitive data.
+
+    Records findings and command output on `config` and returns None. Failures are
+    handled internally so the orchestrator can continue to the next phase.
+    """
     console.print(f"\n[bold cyan]═══ {PHASE} ═══[/bold cyan]\n")
 
     pkg = config.package_name
@@ -115,6 +119,9 @@ def _extract_backup(ab_path: str, tar_path: str, output_dir: str) -> tuple[bool,
     """Extract .ab backup by stripping 24-byte header and zlib decompressing payload.
     Returns (success, info_message)."""
     try:
+        ab_size = Path(ab_path).stat().st_size
+        if ab_size > LIMITS.max_in_memory_read:
+            return False, f"backup too large to process in memory ({ab_size // (1024 * 1024)} MB)"
         raw = Path(ab_path).read_bytes()
         if len(raw) <= 24:
             return False, "Backup file too small"
@@ -225,8 +232,8 @@ def _scan_backup_contents(config: Config, backup_dir: Path) -> None:
             )
 
     try:
-        from phases.dump_verify import _deep_sqlite_analysis, _deep_shared_prefs_analysis
+        from phases.dump_verify import _deep_shared_prefs_analysis, _deep_sqlite_analysis
         _deep_sqlite_analysis(config, backup_dir)
         _deep_shared_prefs_analysis(config, backup_dir)
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError, ImportError) as e:
         console.print(f"  [yellow]Error running deep backup analysis: {e}[/yellow]")

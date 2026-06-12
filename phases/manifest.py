@@ -9,20 +9,27 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
 
-from core.config import Config, MANIFEST_SECURITY_FLAGS
 from core.adb import ADB
+from core.config import LIMITS, MANIFEST_SECURITY_FLAGS, Config
+from utils.helpers import is_valid_package_name
 
 console = Console()
 PHASE = "Phase VIII — Manifest Analysis"
 
 
 def run_manifest_analysis(config: Config, adb: ADB) -> None:
+    """Phase VIII — decompile the APK and inspect the manifest/smali for misconfigurations.
+
+    Records findings and command output on `config` and returns None. Failures are
+    handled internally so the orchestrator can continue to the next phase.
+    """
     console.print(f"\n[bold cyan]═══ {PHASE} ═══[/bold cyan]\n")
 
     pkg = config.package_name
@@ -31,6 +38,9 @@ def run_manifest_analysis(config: Config, adb: ADB) -> None:
 
     # If no local APK, pull from device
     if not apk_path or not Path(apk_path).exists():
+        if not is_valid_package_name(pkg):
+            console.print(f"[red]Invalid package name '{pkg}'. Skipping manifest analysis.[/red]")
+            return
         console.print("[cyan]Pulling APK from device...[/cyan]")
         pm_result = adb.shell(f"pm path {pkg}")
         apk_device_path = pm_result.stdout.strip().replace("package:", "")
@@ -44,7 +54,7 @@ def run_manifest_analysis(config: Config, adb: ADB) -> None:
             return
 
     # ── Decompile with apktool ──
-    console.print(f"[cyan]Decompiling APK with apktool...[/cyan]")
+    console.print("[cyan]Decompiling APK with apktool...[/cyan]")
     try:
         result = subprocess.run(
             ["apktool", "d", apk_path, "-o", str(apktool_dir), "-f"],
@@ -64,7 +74,7 @@ def run_manifest_analysis(config: Config, adb: ADB) -> None:
         return
 
     manifest_content = manifest_path.read_text(encoding="utf-8")
-    config.log_command(PHASE, f"cat AndroidManifest.xml", manifest_content[:5000])
+    config.log_command(PHASE, "cat AndroidManifest.xml", manifest_content[:5000])
 
     # ── Check security flags ──
     console.print("\n[cyan]Checking security flags...[/cyan]\n")
@@ -197,7 +207,7 @@ def _check_intent_filters(config: Config, manifest: str) -> None:
                 if action.get(f"{{{ns['android']}}}name") in generic_actions:
                     has_broad_action = True
                     break
-            
+
             if has_broad_action:
                 for data in filter_elem.iter("data"):
                     scheme = data.get(f"{{{ns['android']}}}scheme")
@@ -206,8 +216,8 @@ def _check_intent_filters(config: Config, manifest: str) -> None:
                         broad_filters.append("VIEW/SEND with http/https scheme")
                     if scheme == "*" or mime == "*/*":
                         broad_filters.append("VIEW/SEND with wildcard scheme/mimeType")
-    except Exception:
-        # Regex/string fallback
+    except ET.ParseError:
+        # Manifest XML didn't parse — fall back to string matching.
         for action in generic_actions:
             if action in manifest:
                 if 'android:scheme="http"' in manifest or 'android:scheme="https"' in manifest:
@@ -408,16 +418,22 @@ def _scan_smali_sources(config: Config, apktool_dir: Path) -> None:
 
     findings_by_type: dict[str, list[str]] = {}
     file_count = 0
-    max_files = 2000
+    # Bound the scan by wall-clock time rather than an arbitrary file count, so
+    # large apps get as much coverage as the budget allows. A hard file cap stays
+    # as a backstop against pathological trees.
+    deadline = time.monotonic() + LIMITS.source_scan_budget_sec
+    max_files = LIMITS.max_scan_files
+    truncated = False
 
     for smali_dir in smali_dirs:
         for smali_file in smali_dir.rglob("*.smali"):
-            file_count += 1
-            if file_count > max_files:
+            if time.monotonic() > deadline or file_count >= max_files:
+                truncated = True
                 break
+            file_count += 1
             try:
                 content = smali_file.read_text(encoding="utf-8", errors="replace")
-            except Exception:
+            except OSError:
                 continue
 
             for finding_type, pattern in patterns.items():
@@ -429,6 +445,14 @@ def _scan_smali_sources(config: Config, apktool_dir: Path) -> None:
                         findings_by_type.setdefault(finding_type, []).append(
                             f"  {relative_path}: {match_str[:80]}"
                         )
+        if truncated:
+            break
+
+    if truncated:
+        console.print(
+            f"  [yellow]Smali scan truncated after {file_count} files "
+            f"(time/scan-count budget reached) — coverage is partial.[/yellow]"
+        )
 
     for finding_type, entries in findings_by_type.items():
         severity = "Medium" if "secret" in finding_type.lower() or "crypto" in finding_type.lower() else "Info"
@@ -436,7 +460,7 @@ def _scan_smali_sources(config: Config, apktool_dir: Path) -> None:
             PHASE,
             f"{finding_type} ({len(entries)} occurrences)",
             severity,
-            f"Found in decompiled smali sources:\n" + "\n".join(entries[:50]),
+            "Found in decompiled smali sources:\n" + "\n".join(entries[:50]),
         )
         console.print(f"  [yellow]{finding_type}: {len(entries)} occurrence(s)[/yellow]")
 

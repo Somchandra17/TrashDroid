@@ -1,9 +1,10 @@
-rich>=13.0
+# Base runtime dependency (pinned for reproducible installs).
+rich==14.3.3
 
 # Optional: Presidio PII detection (regex + checksum validators)
 # Install with: pip install -r requirements-presidio.txt
-# Or: pip install presidio-analyzer>=2.2.35
+# Or: pip install -e ".[presidio]"
 
 # Optional: GLiNER NER backend (ML-based PII detection, ~560 MB model)
 # Install with: pip install -r requirements-ner.txt
-# Or: pip install "presidio-analyzer[gliner]>=2.2.35"
+# Or: pip install -e ".[ner]"

@@ -7,9 +7,10 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
 
 from rich.console import Console
+
+from core.config import DROZER_PORT
 
 console = Console()
 
@@ -19,6 +20,9 @@ _NOISE_PATTERNS = re.compile(
     r"\.\.\.|^\s*$|^Usage:|^See help)",
     re.IGNORECASE,
 )
+
+# Valid drozer module name shape, e.g. "scanner.provider.injection".
+_DROZER_MODULE_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_.]*$")
 
 # Drozer module-level error indicators in stdout/stderr
 _MODULE_ERROR_PATTERNS = re.compile(
@@ -89,7 +93,7 @@ class Drozer:
         cmd = ["adb"]
         if self.device_id:
             cmd += ["-s", self.device_id]
-        cmd += ["forward", "tcp:31415", "tcp:31415"]
+        cmd += ["forward", f"tcp:{DROZER_PORT}", f"tcp:{DROZER_PORT}"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return result.returncode == 0
 
@@ -109,6 +113,18 @@ class Drozer:
         return False
 
     def run_module(self, module: str, args: str = "", timeout: int = 30) -> DrozerResult:
+        # The command string is parsed by the drozer console; reject control
+        # characters (newline/CR/NUL) and malformed module names so a crafted
+        # value can't inject additional drozer console commands.
+        if not _DROZER_MODULE_RE.match(module or "") or any(c in (module + args) for c in ("\n", "\r", "\x00")):
+            return DrozerResult(
+                module=module,
+                args=args,
+                stdout="",
+                stderr="rejected: invalid module name or control characters in drozer command",
+                success=False,
+            )
+
         full_cmd = f"run {module}"
         if args:
             full_cmd += f" {args}"

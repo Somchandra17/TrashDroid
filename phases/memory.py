@@ -13,30 +13,36 @@ Memory dump strategy (fallback chain):
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 import time
 from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm
 
-from core.config import Config, SENSITIVE_PATTERNS, LIMITS
-from core.adb import ADB
-from utils.helpers import presidio_scan_text, presidio_findings_to_report
+from core.adb import ADB, ADBError
+from core.config import FRIDA_SERVER_PATH, LIMITS, SENSITIVE_PATTERNS, Config
+from utils.helpers import is_valid_package_name, presidio_findings_to_report, presidio_scan_text
 
 console = Console()
 PHASE = "Phase VI — Memory Analysis"
 
-FRIDA_SERVER_PATH = "/data/local/tmp/frida-server"
 MAX_DUMP_MB = LIMITS.max_dump_mb
 
 
 def run_memory_analysis(config: Config, adb: ADB) -> None:
+    """Phase VI — dump application memory and scan it for sensitive data.
+
+    Records findings and command output on `config` and returns None. Failures are
+    handled internally so the orchestrator can continue to the next phase.
+    """
     console.print(f"\n[bold cyan]═══ {PHASE} ═══[/bold cyan]\n")
 
     pkg = config.package_name
+    if not is_valid_package_name(pkg):
+        console.print(f"[red]Invalid package name '{pkg}'. Skipping memory analysis.[/red]")
+        config.log_command(PHASE, "validate package", "", f"invalid package name: {pkg}", rc=1)
+        return
 
     if not config.auto_mode:
         console.print(Panel(
@@ -57,6 +63,14 @@ def run_memory_analysis(config: Config, adb: ADB) -> None:
     if not pid:
         console.print("[red]Could not get PID for the app. Skipping memory analysis.[/red]")
         config.add_finding(PHASE, "Memory analysis skipped — PID not found", "Info", "App was not running.")
+        return
+
+    # pidof may return several space-separated PIDs; take the first and require it
+    # to be purely numeric before it is interpolated into /proc/{pid} shell commands.
+    pid = pid.split()[0] if pid.split() else ""
+    if not pid.isdigit():
+        console.print(f"[red]Unexpected PID value '{pid}'. Skipping memory analysis.[/red]")
+        config.add_finding(PHASE, "Memory analysis skipped — invalid PID", "Info", f"pidof returned: {pid!r}")
         return
 
     console.print(f"  [green]App PID: {pid}[/green]")
@@ -224,6 +238,9 @@ def _frida_dump(config: Config, adb: ADB, pkg: str, pid: str, local_path: str) -
                         else:
                             errors += 1
                     except Exception:
+                        # Per-chunk best-effort: frida raises a wide, version-specific
+                        # set of RPC/transport errors for unreadable regions. Count and
+                        # continue rather than aborting the whole dump.
                         errors += 1
                     offset += read_sz
 
@@ -239,6 +256,9 @@ def _frida_dump(config: Config, adb: ADB, pkg: str, pid: str, local_path: str) -
         return dumped > 0
 
     except Exception as e:
+        # frida is an optional dependency whose attach/RPC failures span many
+        # version-specific exception types; treat any as a failed dump and move
+        # on to the next fallback strategy.
         console.print(f"  [yellow]Frida dump failed: {e}[/yellow]")
         config.log_command(PHASE, "frida memory dump", "", str(e))
         return False
@@ -268,7 +288,7 @@ def _am_dumpheap(config: Config, adb: ADB, pkg: str, local_path: str) -> bool:
             return True
         console.print("  [yellow]am dumpheap: file is empty.[/yellow]")
         return False
-    except Exception as e:
+    except (ADBError, OSError) as e:
         console.print(f"  [yellow]am dumpheap pull failed: {e}[/yellow]")
         return False
     finally:
@@ -357,7 +377,7 @@ def _dd_proc_mem(config: Config, adb: ADB, pid: str, local_path: str) -> bool:
             return True
         console.print("  [yellow]dd dump came back empty.[/yellow]")
         return False
-    except Exception as e:
+    except (ADBError, OSError) as e:
         console.print(f"  [yellow]dd /proc/mem failed: {e}[/yellow]")
         return False
     finally:
