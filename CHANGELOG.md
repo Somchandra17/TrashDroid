@@ -16,6 +16,11 @@ All notable changes to the TrashDroid framework will be documented in this file.
   - Deeper XML and Shared Preferences string extraction avoiding duplicate entity entries.
 - **Enhanced Logcat Collection**: Background Logcat Collector timeout and lifecycle improvements.
 - Dockerfile updated with `ENABLE_NER` build arg and auto-caching.
+- **Per-phase watchdog**: in `--auto` mode each phase is bounded by `TIMING.phase_budget_sec`; a wedged `adb`/drozer/frida call is abandoned with a "Phase timed out" finding so the run continues.
+- **Test suite & CI**: offline `unittest` coverage for `adb`, `drozer`, `report`, and phase guards/smoke tests (Presidio engine tests skip cleanly when the model is absent); a GitHub Actions workflow running `ruff` + `py_compile` + the test suite on Python 3.10–3.12.
+- **Packaging**: `pyproject.toml` makes the project installable (`pip install -e .`, optional `[presidio]`/`[ner]` extras) and exposes a `trashdroid` console entry point; `ruff` lint config included.
+- `TESTING.md` documenting the offline test commands and a manual device-run checklist.
+- Pinned dependency versions in `requirements*.txt` for reproducible installs.
 
 ### Changed
 - Configurable screenshot delay now available via new `--screenshot-delay` CLI flag.
@@ -24,6 +29,9 @@ All notable changes to the TrashDroid framework will be documented in this file.
 - PII startup behavior is now explicit and deterministic:
   - `--presidio`: warns and falls back to regex-only on backend init failure.
   - `--ner`: fails fast with non-zero exit on backend init failure (no silent downgrade).
+- Report CVSS is now computed from the (context-adjusted) CVSS 3.1 vector, so the score and vector always agree across every severity.
+- Consolidated the duplicated logcat capture/terminate plumbing into a shared `utils/proc.py` helper used by both the foreground and background collectors.
+- `PresidioEngine` lazy initialization is now thread-safe (double-checked locking).
 
 ### Fixed
 - Fixed false-positive backend status where NER could be shown as enabled before analyzer warmup succeeded.
@@ -32,6 +40,11 @@ All notable changes to the TrashDroid framework will be documented in this file.
   - Phase V foreground collector now force-terminates stuck `adb logcat` subprocesses under low-log conditions.
 - Cleanup path now stops background logcat collectors during signal/exit handling and is idempotent to avoid duplicate cleanup/report behavior.
 - Added compatibility for new Presidio GLiNER module path and constructor args in recent versions (`predefined_recognizers.ner.gliner_recognizer`, `model_name`/`threshold`).
+- **Report rendering & scoring**: CVSS score/vector are now consistent (computed, not string-patched); screenshot-to-finding matching uses token scoring instead of an all-or-nothing substring skip (provider/intent findings keep their evidence); finding titles/details/captions are Markdown-escaped so pipes, backtick runs, and special characters can no longer break tables, code fences, or image links.
+- Narrowed broad `except Exception` handlers to specific exception types across `core/` and `phases/`; bounded previously-unbounded file/directory scans; switched large APK hashing to streaming and guarded large in-memory reads.
+- `ADB.run()` now raises a clear `ADBError` when `adb` is missing instead of leaking a raw `FileNotFoundError`, and corrected the documented `--report` flag (was `--report-mode`).
 
 ### Security
 - Shifted away from naive, regex-only `SENSITIVE_PATTERNS` to lower false-positive rates of data detection metrics.
+- **Shell-input hardening**: package names, device paths, activity components, and PIDs are validated (allow-list) before being interpolated into `adb`/`su -c` shell commands across `core/adb.py`, `phases/memory.py`, and the drozer/manifest/post-logout phases; malformed values are rejected at the boundary.
+- `drozer.run_module` rejects malformed module names and control-character (newline/CR/NUL) injection into the drozer console command.
