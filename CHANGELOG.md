@@ -34,6 +34,7 @@ All notable changes to the TrashDroid framework will be documented in this file.
 - `PresidioEngine` lazy initialization is now thread-safe (double-checked locking).
 
 ### Fixed
+- **Phase IV/III binary-decode crash**: deep SQLite analysis (`SELECT *`) and binary `strings` extraction now decode subprocess output with `errors="replace"`, and `UnicodeDecodeError` (a `ValueError` subclass) is caught per file — a single BLOB-bearing or non-UTF-8 database can no longer abort the phase (previously `phases/dump_verify.py` crashed out of Phase IV, losing the shared-prefs/binary/WebView steps). SQLite WAL sidecars (`*-shm`/`*-wal`/`*-journal`, dash-separated) are now skipped instead of being mis-reported as "Encrypted DB".
 - Fixed false-positive backend status where NER could be shown as enabled before analyzer warmup succeeded.
 - Hardened logcat process lifecycle:
   - Background collector now owns and force-terminates `adb logcat` subprocesses deterministically.

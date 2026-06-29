@@ -59,14 +59,18 @@ def _deep_sqlite_analysis(config: Config, db_dir: Path) -> None:
         return
 
     db_files = list(db_dir.rglob("*"))
-    db_files = [f for f in db_files if f.is_file() and f.suffix not in [".journal", ".wal", ".shm"]]
+    # SQLite sidecar files use a DASH (mis_db-shm/-wal/-journal), so a .suffix check misses
+    # them — they then get read as standalone DBs and mis-reported as "Encrypted DB". Match
+    # both dash- and dot-separated forms on the full name.
+    _sidecar = (".journal", ".wal", ".shm", "-journal", "-wal", "-shm")
+    db_files = [f for f in db_files if f.is_file() and not f.name.endswith(_sidecar)]
 
     for db_file in db_files:
         try:
             # Get all table names
             result = subprocess.run(
                 ["sqlite3", str(db_file), ".tables"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, errors="replace", timeout=10,
             )
             tables_out = result.stdout.strip()
             stderr_out = result.stderr.strip().lower()
@@ -89,13 +93,13 @@ def _deep_sqlite_analysis(config: Config, db_dir: Path) -> None:
                 # Get row count
                 count_out = subprocess.run(
                     ["sqlite3", str(db_file), f"SELECT COUNT(*) FROM [{table}];"],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, errors="replace", timeout=10,
                 ).stdout.strip()
 
                 # Get column info
                 pragma_out = subprocess.run(
                     ["sqlite3", str(db_file), f"PRAGMA table_info([{table}]);"],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, errors="replace", timeout=10,
                 ).stdout.strip()
 
                 config.log_command(
@@ -107,7 +111,7 @@ def _deep_sqlite_analysis(config: Config, db_dir: Path) -> None:
                 # Select first 5 rows to check data
                 select_out = subprocess.run(
                     ["sqlite3", str(db_file), f"SELECT * FROM [{table}] LIMIT 5;"],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, errors="replace", timeout=10,
                 ).stdout.strip()
 
                 if select_out:
@@ -122,7 +126,9 @@ def _deep_sqlite_analysis(config: Config, db_dir: Path) -> None:
                             ),
                         )
 
-        except (subprocess.SubprocessError, OSError) as e:
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
+            # ValueError covers UnicodeDecodeError from binary BLOB columns — a single
+            # malformed DB must not abort the whole phase.
             console.print(f"  [yellow]Error on {db_file.name}: {e}[/yellow]")
 
 
@@ -218,7 +224,7 @@ def _binary_string_extraction(config: Config, base_dir: Path) -> None:
             try:
                 result = subprocess.run(
                     ["strings", str(f)],
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, errors="replace", timeout=30,
                 )
                 pii = presidio_scan_text(result.stdout, config, source_label=f"binary:{f.name}")
                 if pii:

@@ -237,7 +237,7 @@ def _analyze_databases(config: Config, base_dir: str) -> None:
             # List tables
             tables_result = subprocess.run(
                 ["sqlite3", str(db_file), ".tables"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, errors="replace", timeout=10,
             )
             tables = tables_result.stdout.strip()
             config.log_command(PHASE, f"sqlite3 {db_file.name} '.tables'", tables)
@@ -248,14 +248,14 @@ def _analyze_databases(config: Config, base_dir: str) -> None:
             # Dump schema
             schema_result = subprocess.run(
                 ["sqlite3", str(db_file), ".schema"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, errors="replace", timeout=10,
             )
             config.log_command(PHASE, f"sqlite3 {db_file.name} '.schema'", schema_result.stdout)
 
             # Full dump and grep
             dump_result = subprocess.run(
                 ["sqlite3", str(db_file), ".dump"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, errors="replace", timeout=30,
             )
 
             # Save full dump
@@ -275,7 +275,8 @@ def _analyze_databases(config: Config, base_dir: str) -> None:
         except FileNotFoundError:
             console.print("  [yellow]sqlite3 not available — skipping DB analysis.[/yellow]")
             break
-        except (subprocess.SubprocessError, OSError) as e:
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
+            # ValueError covers UnicodeDecodeError on non-UTF-8 DB output.
             console.print(f"  [yellow]Error analyzing {db_file.name}: {e}[/yellow]")
 
 
@@ -345,7 +346,7 @@ def _analyze_nosql(config: Config, adb: ADB, pkg: str, base_dir: str) -> None:
         try:
             result = subprocess.run(
                 ["strings", str(f)],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, errors="replace", timeout=30,
             )
             pii = presidio_scan_text(result.stdout, config, source_label=f"nosql:{f.name}")
             if pii:
