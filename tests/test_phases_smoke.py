@@ -12,14 +12,17 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.config import Config
+from phases.backup import run_backup_analysis
 from phases.filesystem import run_filesystem_analysis
 from phases.manifest import run_manifest_analysis
 from phases.memory import run_memory_analysis
+from phases.post_logout import run_post_logout_testing
+from phases.setup import _sha256_file, install_and_prepare, select_device
 
 
 def _ns(stdout="", stderr="", rc=0):
@@ -87,6 +90,54 @@ class TestFilesystemHappyPath(unittest.TestCase):
             # Should complete without raising and produce a grep results artifact.
             run_filesystem_analysis(c, _FakeADB())
             self.assertTrue((Path(d) / "grep_results.txt").exists())
+
+
+class TestSetup(unittest.TestCase):
+    @patch("phases.setup.ADB.get_devices", return_value=[])
+    def test_select_device_none(self, _):
+        self.assertEqual(select_device(), "")
+
+    @patch("phases.setup.ADB.get_devices", return_value=["only-dev"])
+    def test_select_device_autoselects_single(self, _):
+        self.assertEqual(select_device(), "only-dev")
+
+    def test_sha256_file_streams_correct_digest(self):
+        import hashlib
+        payload = b"trashdroid" * 1000
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "a.bin"
+            p.write_bytes(payload)
+            self.assertEqual(_sha256_file(p), hashlib.sha256(payload).hexdigest())
+
+    def test_install_and_prepare_auto_no_apk(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = _config(Path(d))
+            c.auto_mode = True
+            c.apk_path = None
+            adb = MagicMock()
+            install_and_prepare(adb, c)  # auto mode: no prompts, must not raise
+            adb.install_apk.assert_not_called()
+            self.assertFalse(c.logged_in)
+
+
+class TestBackupSmoke(unittest.TestCase):
+    def test_empty_backup_records_finding_without_raising(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = _config(Path(d))
+            c.auto_mode = True
+            adb = MagicMock()
+            adb.backup.return_value = _ns(rc=0)  # command returns but writes no backup file
+            run_backup_analysis(c, adb)  # must not raise
+            titles = [f.get("title", "") for lst in c.findings.values() for f in lst]
+            self.assertTrue(any("backup" in t.lower() for t in titles))
+
+
+class TestPostLogoutSmoke(unittest.TestCase):
+    def test_bad_package_short_circuits(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = _config(Path(d), package="bad pkg; rm -rf /")
+            run_post_logout_testing(c, MagicMock(), MagicMock(), MagicMock())  # must not raise
+            self.assertTrue(any(e["rc"] == 1 for e in c.commands_log))
 
 
 if __name__ == "__main__":
