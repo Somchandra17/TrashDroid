@@ -18,7 +18,11 @@ def start_logcat_process(device_id: str = "") -> subprocess.Popen:
     if device_id:
         cmd += ["-s", device_id]
     cmd += ["logcat", "-v", "threadtime"]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # errors="replace": logcat carries arbitrary app bytes; a non-UTF-8 byte must not
+    # raise UnicodeDecodeError in the reader and silently kill the capture thread.
+    return subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
 
 
 def terminate_process(proc: subprocess.Popen | None, force_kill: bool = True) -> None:

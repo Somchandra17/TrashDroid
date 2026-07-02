@@ -21,6 +21,7 @@ from core.pii_runtime import initialize_pii_detection
 from core.runtime_cleanup import RuntimeCleanupManager
 from phases.logcat import run_logcat_monitoring
 from utils.logcat_collector import BackgroundLogcatCollector
+from utils.proc import start_logcat_process
 
 
 class _SimpleConfig:
@@ -197,6 +198,15 @@ class TestForegroundLogcatMonitoringLifecycle(unittest.TestCase):
 
         self.assertGreaterEqual(proc.terminate_calls, 1)
         self.assertGreaterEqual(proc.kill_calls, 1)
+
+
+class TestLogcatProcessDecoding(unittest.TestCase):
+    @patch("utils.proc.subprocess.Popen")
+    def test_logcat_stream_tolerates_non_utf8(self, popen_mock):
+        start_logcat_process("device")
+        # A non-UTF-8 byte from a misbehaving app must be replaced, not crash the reader.
+        self.assertEqual(popen_mock.call_args.kwargs.get("errors"), "replace")
+        self.assertTrue(popen_mock.call_args.kwargs.get("text"))
 
 
 class TestRuntimeCleanupManager(unittest.TestCase):
