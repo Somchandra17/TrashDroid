@@ -25,6 +25,9 @@ _DEVICE_PATH_RE = re.compile(r'^[A-Za-z0-9_./@%+-]+$')
 # Activity/component reference: optional leading dot (relative), then dotted
 # Java identifiers — e.g. "com.example.MainActivity" or ".activities.Main".
 _COMPONENT_RE = re.compile(r'^\.?[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)*$')
+# Intent extras appended to an `am start` shell string: identifiers, spaces, and
+# URL/path punctuation only — no shell metacharacters (`;`, `|`, `&`, `$`, backticks, …).
+_EXTRAS_RE = re.compile(r'^[A-Za-z0-9 _./:=@%+,-]*$')
 
 
 def is_valid_package_name(pkg: str) -> bool:
@@ -56,6 +59,16 @@ def is_safe_device_path(path: str) -> bool:
     if ".." in path:
         return False
     return bool(_DEVICE_PATH_RE.match(path))
+
+
+def is_safe_intent_extras(extras: str) -> bool:
+    """Return True if `extras` is safe to append to an `am start` shell string.
+
+    Intent extras are `am` flag tokens (e.g. `--ez key true`, `--es key value`). Allow a
+    conservative set (identifiers, spaces, and URL/path punctuation) and reject shell
+    metacharacters so a value can never inject additional commands into `adb shell`.
+    """
+    return bool(_EXTRAS_RE.match(extras or ""))
 
 
 def grep_sensitive_lines(text: str, max_lines: int = 200) -> str:

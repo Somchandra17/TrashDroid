@@ -11,7 +11,12 @@ from typing import Optional
 
 from rich.console import Console
 
-from utils.helpers import is_safe_device_path, is_valid_component_name, is_valid_package_name
+from utils.helpers import (
+    is_safe_device_path,
+    is_safe_intent_extras,
+    is_valid_component_name,
+    is_valid_package_name,
+)
 
 console = Console()
 
@@ -190,6 +195,8 @@ class ADB:
         _require_package(package)
         if not is_valid_component_name(activity):
             raise ADBError(f"Refusing to start invalid activity component: {activity!r}")
+        if extras and not is_safe_intent_extras(extras):
+            raise ADBError(f"Refusing to pass unsafe intent extras to shell: {extras!r}")
         cmd = f"am start -n {package}/{activity}"
         if extras:
             cmd += f" {extras}"

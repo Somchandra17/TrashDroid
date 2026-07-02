@@ -7,6 +7,7 @@ Creates an ADB backup, extracts it, and scans for sensitive data.
 from __future__ import annotations
 
 import subprocess
+import tarfile
 import zlib
 from pathlib import Path
 
@@ -115,6 +116,34 @@ def run_backup_analysis(config: Config, adb: ADB) -> None:
     console.print(f"\n[green]✓ {PHASE} complete.[/green]")
 
 
+def _safe_extract_tar(tar_path: str, output_dir: str) -> bool:
+    """Extract a tar archive, refusing any member that would escape ``output_dir``.
+
+    The system ``tar`` honours ``../`` and absolute paths in a crafted archive, so a
+    malicious backup could write outside the intended directory. Extract via Python's
+    ``tarfile`` instead and validate that every member's resolved destination stays
+    inside ``output_dir``; skip symlink/hardlink members and path-traversal entries.
+    """
+    base = Path(output_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(tar_path) as tar:
+            safe_members = []
+            for member in tar.getmembers():
+                if member.issym() or member.islnk():
+                    console.print(f"  [yellow]Skipping link member in backup: {member.name}[/yellow]")
+                    continue
+                dest = (base / member.name).resolve()
+                if dest != base and base not in dest.parents:
+                    console.print(f"  [yellow]Skipping unsafe backup path: {member.name}[/yellow]")
+                    continue
+                safe_members.append(member)
+            tar.extractall(base, members=safe_members)
+        return True
+    except (OSError, tarfile.TarError):
+        return False
+
+
 def _extract_backup(ab_path: str, tar_path: str, output_dir: str) -> tuple[bool, str]:
     """Extract .ab backup by stripping 24-byte header and zlib decompressing payload.
     Returns (success, info_message)."""
@@ -147,13 +176,7 @@ def _extract_backup(ab_path: str, tar_path: str, output_dir: str) -> tuple[bool,
 
         tar_file = Path(tar_path)
         if tar_file.exists() and tar_file.stat().st_size > 0:
-            Path(output_dir).mkdir(parents=True, exist_ok=True)
-            tar_result = subprocess.run(
-                ["tar", "xf", tar_path, "-C", output_dir],
-                timeout=60,
-                capture_output=True,
-            )
-            if tar_result.returncode == 0:
+            if _safe_extract_tar(tar_path, output_dir):
                 return True, "extracted"
     except (OSError, zlib.error, subprocess.TimeoutExpired):
         return False, "zlib_or_encrypted"
@@ -170,14 +193,7 @@ def _extract_backup_abe(ab_path: str, tar_path: str, output_dir: str) -> bool:
         if result.returncode != 0:
             return False
         if Path(tar_path).exists() and Path(tar_path).stat().st_size > 0:
-            Path(output_dir).mkdir(parents=True, exist_ok=True)
-            tar_result = subprocess.run(
-                ["tar", "xf", tar_path, "-C", output_dir],
-                timeout=60,
-                capture_output=True,
-            )
-            if tar_result.returncode == 0:
-                return True
+            return _safe_extract_tar(tar_path, output_dir)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
     return False

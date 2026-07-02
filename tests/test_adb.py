@@ -83,6 +83,21 @@ class TestADBInputGuards(unittest.TestCase):
         out = ADB().start_activity("com.example.app", ".MainActivity")
         self.assertEqual(out, "Starting")
 
+    def test_start_activity_rejects_unsafe_extras(self):
+        a = ADB()
+        for bad in ["--es u $(reboot)", "--es u a; rm -rf /", "--ez x true && id", "x `id`", "a | nc h 1"]:
+            with self.assertRaises(ADBError):
+                a.start_activity("com.example.app", ".MainActivity", bad)
+
+    @patch("core.adb.subprocess.run")
+    def test_start_activity_accepts_safe_extras(self, mock_run):
+        mock_run.return_value = _completed(stdout="Starting")
+        # URL/path punctuation in extras is legitimate and must be allowed through.
+        out = ADB().start_activity(
+            "com.example.app", ".MainActivity", "--es redirect_uri https://evil.com --ez is_admin true"
+        )
+        self.assertEqual(out, "Starting")
+
 
 if __name__ == "__main__":
     unittest.main()

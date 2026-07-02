@@ -71,6 +71,11 @@ class ScreenshotManager:
         safe_label = label.replace(" ", "_").replace("/", "_").replace(".", "_")[:60]
         filename = f"{phase}_{safe_label}_{ts}_{self._counter}.png"
         output_path = self.screenshot_dir / filename
+        # Defence in depth: the label is already sanitised, but confirm the resolved
+        # path can never escape the screenshot directory before writing to it.
+        if not output_path.resolve().is_relative_to(self.screenshot_dir.resolve()):
+            console.print(f"[yellow]  Refusing screenshot path outside output dir: {filename}[/yellow]")
+            return None
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path = str(output_path)
 
