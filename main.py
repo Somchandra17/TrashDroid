@@ -24,6 +24,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
 
+from core import __version__
 from core.adb import ADB
 from core.config import BANNER, TIMING, Config
 from core.drozer import Drozer
@@ -55,11 +56,26 @@ ALL_PHASES = {
     9: ("Phase IX  — Post-Logout Access Control", "post_logout"),
 }
 
+_EXAMPLES = """\
+examples:
+  python main.py                                    interactive (pick device + app)
+  python main.py --auto --package com.example.app   non-interactive, all phases
+  python main.py --phases 1,3,8 --package com.x      run only the named phases
+  python main.py --presidio --auto --package com.x   enable Presidio PII detection
+  python main.py --version                           print version and exit
+"""
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Android DAST — Automated VAPT Framework",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_EXAMPLES,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"TrashDroid {__version__}",
     )
     parser.add_argument(
         "--skip-preflight",

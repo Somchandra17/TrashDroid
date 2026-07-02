@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trashdroid"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Android DAST — automated dynamic VAPT framework"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,9 @@ trashdroid = "main:main"
 [tool.setuptools]
 py-modules = ["main"]
 packages = ["core", "phases", "utils"]
+
+[tool.setuptools.dynamic]
+version = { attr = "core.__version__" }
 
 [tool.ruff]
 line-length = 120
