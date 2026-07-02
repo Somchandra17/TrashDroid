@@ -486,6 +486,12 @@ Presidio engine tests skip automatically unless `presidio-analyzer` **and** its 
 
 ---
 
+## Contributing
+
+Contributions are welcome — see **[CONTRIBUTING.md](CONTRIBUTING.md)** for the dev setup and the pre-PR gate (unit tests + `ruff` + byte-compile, all offline). Found a security issue in TrashDroid *itself*? Please report it privately per **[SECURITY.md](SECURITY.md)**.
+
+---
+
 ## Troubleshooting
 
 <details>
