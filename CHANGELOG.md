@@ -4,7 +4,14 @@ All notable changes to the TrashDroid framework will be documented in this file.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-07
+
 ### Added
+- **AI-Review Pipeline** (ported from TrashiOS): after a run, TrashDroid assembles a self-contained `output/<pkg>/ai_review/` evidence package — deduped `findings.json` (stable `F-###` ids, each with a per-finding evidence map of screenshots + logs), a header-stripped `report.md`, `screenshots/` (+ `index.json`), `logs/` (full `commands.log` + raw grep/logcat/backup/memory artifacts), `PROMPT.md`, `CLAUDE.md`, `run_review.sh`, and the bundled `gen_html.py` — then offers a 4-way AI triage menu (interactive `claude` / headless streaming / custom `$TRASHDROID_REVIEW_CMD` / print prompt). New `--ai-review` flag runs the triage headless; the bundled `gen_html.py` turns the AI's `final_report.md` into a self-contained, self-validating `final_report.html`.
+- **Phase X — Runtime Hardening**: SSL certificate-pinning and root/debugger-detection bypass via `objection` with a self-contained raw-Frida fallback (objection optional). Works on Frida 17 by prepending the bundled Java bridge.
+- **Interactive target-app picker**: a numbered picker (`pm list packages -3`) — pick a number or type/paste a package id — with an install-existence check, replacing blind package-name typing.
+- **Automatic drozer agent recovery**: on a wedged/unreachable agent, TrashDroid restarts its embedded server (rooted: persist `localServerEnabled` + relaunch + PWN broadcast) and reconnects, so a mid-run agent failure no longer aborts Phase I / IX.
+- Shared host-tool runner `utils/proc.run_tool` / `have_tool` with uniform timeout / missing-binary handling.
 - **Context-Aware PII Detection**: Integrated Microsoft Presidio and GLiNER NER for advanced, machine-learning-based PII matching.
   - Added new CLI flags: `--presidio` (regex + checksum validators) and `--ner` (ML-based NLP entity extraction).
   - Implemented a unified centralized `PresidioEngine` singleton pattern with lazy-initialization to ensure zero impact when not used.
@@ -23,6 +30,9 @@ All notable changes to the TrashDroid framework will be documented in this file.
 - Pinned dependency versions in `requirements*.txt` for reproducible installs.
 
 ### Changed
+- Unified the duplicated drozer connect/recover logic (Phase I + Phase IX) into `phases/drozer_common.py`.
+- Centralized the default screenshot delay on `TIMING.screenshot_settle_delay` (was hardcoded in four places).
+- `AI_PROMPT` upgraded to a verdict / false-positive / MASVS-MASTG triage prompt (used by the report header and the AI-review `PROMPT.md`).
 - Configurable screenshot delay now available via new `--screenshot-delay` CLI flag.
 - Improved app-sec `NOISE_TAGS` filtering for logcat dumps.
 - Manifest Phase logic upgraded with strict XML parsing for intent-filters and exported components.
@@ -34,6 +44,12 @@ All notable changes to the TrashDroid framework will be documented in this file.
 - `PresidioEngine` lazy initialization is now thread-safe (double-checked locking).
 
 ### Fixed
+- **Drozer intent-sniffing false finding**: the pysolar "yayerroryay / valid drozer server" `RuntimeError` (emitted when the on-device agent server wedges) is no longer printed as module output or filed as a bogus "Browsable activities found" finding; connection failures are detected and their output blanked.
+- `--apk` without `--package` now derives the package id from the APK (was silently ignored); `--package` is format-validated; `--auto` without a target errors clearly instead of hanging on an interactive prompt.
+- `ADB.get_devices()` / `is_rooted()` degrade gracefully instead of raising an uncaught error when `adb` is missing (notably with `--skip-preflight`).
+- `is_package_installed` matches the exact `package:<id>` line (was a substring match that reported a prefix as installed).
+- `pull_as_root` skips a nonexistent directory cleanly — no more misleading "root copy failed" for an app with no `app_webview/`.
+- Corrected the drozer agent launch activity to its real class (`com.WithSecure.dz…`, capital-W).
 - **Phase IV/III binary-decode crash**: deep SQLite analysis (`SELECT *`) and binary `strings` extraction now decode subprocess output with `errors="replace"`, and `UnicodeDecodeError` (a `ValueError` subclass) is caught per file — a single BLOB-bearing or non-UTF-8 database can no longer abort the phase (previously `phases/dump_verify.py` crashed out of Phase IV, losing the shared-prefs/binary/WebView steps). SQLite WAL sidecars (`*-shm`/`*-wal`/`*-journal`, dash-separated) are now skipped instead of being mis-reported as "Encrypted DB".
 - Fixed false-positive backend status where NER could be shown as enabled before analyzer warmup succeeded.
 - Hardened logcat process lifecycle:

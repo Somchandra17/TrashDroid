@@ -8,4 +8,4 @@ __all__ = ["Config", "ADB", "Drozer", "ScreenshotManager", "ReportGenerator"]
 
 # Single source of truth for the package version (pyproject reads this via
 # [tool.setuptools.dynamic]). Bump here on release.
-__version__ = "0.1.0"
+__version__ = "1.2.0"
