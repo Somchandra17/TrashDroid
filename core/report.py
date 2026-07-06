@@ -45,10 +45,49 @@ def _md_image(caption: str, path: str) -> str:
     return f"![{alt}](<{safe_path}>)"
 
 
-AI_PROMPT = """You are a senior mobile security engineer. Review the following Android DAST findings,
-assign a CVSS-style risk rating (Critical / High / Medium / Low / Info) to each finding,
-write an executive summary, and generate a Jira ticket description for each High and Critical finding.
-Provide remediation recommendations for every finding."""
+AI_PROMPT = """ROLE: You are a senior Android application penetration tester triaging the RAW output of an
+automated SAST/DAST tool (TrashDroid). Automated tooling over-reports — much of what follows is noise:
+regex/keyword matches on harmless strings, third-party SDK artifacts, expected platform behaviour, or
+issues that only matter on an already-compromised device. The tool's own Severity / Confidence /
+"CVSS (estimated)" fields are HEURISTIC — treat them as hints, not ground truth.
+
+PRIMARY OBJECTIVE: Separate real, exploitable findings from false positives. Do NOT just restate the
+tool's output. Be skeptical; when the evidence is thin, say so.
+
+For EVERY finding assign a verdict:
+  - CONFIRMED      : concrete evidence of a real, exploitable weakness.
+  - LIKELY         : probably real but needs ONE manual check (state exactly what to verify).
+  - FALSE POSITIVE : noise — give the one-line reason.
+  - INFORMATIONAL  : true but not a vulnerability by itself (attack surface / defence-in-depth gap).
+
+Treat the following as FALSE POSITIVE / low-signal UNLESS corroborated by concrete evidence:
+  - "Sensitive data" / "PII" regex or Presidio hits where the matched text is a KEY NAME, label,
+    enum, placeholder, file path, or framework constant — not an actual secret VALUE.
+  - Items owned by a third-party SDK (Firebase, Google, Microsoft Intune/MAM, analytics/crash SDKs)
+    rather than the app's own code or the user's data.
+  - "Recoverable only on a rooted device" items (app-data / SharedPreferences / DB pulls, memory
+    dump, ADB backup): they presuppose device compromise — rate REAL-WORLD risk accordingly, do not
+    inflate.
+  - OAuth/SSO redirect / deep-link schemes (e.g. msauth.*, fb*, google*) and framework-generated
+    intent filters — usually not injectable app entry points.
+  - Exported library/framework components (androidx.*, com.google.android.gms.*, com.google.firebase.*)
+    flagged as attack surface — not app-owned entry points.
+  - allowBackup / debuggable / cleartext flags reported without demonstrated sensitive exposure —
+    verify the real data at risk before rating.
+
+For CONFIRMED and LIKELY findings only:
+  1. Re-derive a context-aware CVSS 3.1 vector + score from the attack prerequisites
+     (network vs local-app / cross-app IPC vs physical/rooted access) — do not copy the tool's estimate.
+  2. Map to the specific OWASP MASVS control and MASTG test id.
+  3. Give concrete, code-level remediation.
+  4. For each High/Critical, write a Jira-ready ticket: title, severity, steps to reproduce, impact, fix.
+
+OUTPUT, in this order:
+  A. Executive summary (2-4 sentences) — the real risk posture, noise excluded.
+  B. Triage table covering EVERY finding: Finding | Verdict | Real severity | One-line justification.
+  C. Detailed write-ups + Jira tickets — CONFIRMED/LIKELY High & Critical only.
+  D. "To manually verify" — the checks that would resolve the LIKELY items.
+Spend no more than one table row on anything you rule a FALSE POSITIVE."""
 
 EXPECTED_PHASES = [
     "Phase I — Drozer Component Testing",

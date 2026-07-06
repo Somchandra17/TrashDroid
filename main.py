@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import os
 import signal
 import sys
 import threading
@@ -135,6 +136,12 @@ def parse_args() -> argparse.Namespace:
         "--ner",
         action="store_true",
         help="Enable GLiNER NER backend for ML-based PII detection (implies --presidio, fails fast on init errors)",
+    )
+    parser.add_argument(
+        "--ai-review",
+        action="store_true",
+        help="After the run, auto-run `claude` (or $TRASHDROID_REVIEW_CMD) headless over the "
+             "ai_review/ package to write final_report.md (+ final_report.html)",
     )
     return parser.parse_args()
 
@@ -434,8 +441,43 @@ def main() -> int:
         expand=False,
     ))
 
-    console.print("\n[dim]Tip: Feed the generated .md report into an AI model for "
-                  "risk rating, executive summary, and Jira ticket generation.[/dim]\n")
+    # ── Assemble the AI-review evidence package (findings + screenshots + raw logs + prompt) ──
+    from core.ai_review import (
+        assemble_review_package,
+        launch_claude_interactive,
+        print_next_steps,
+        run_claude_review,
+    )
+    pkg = assemble_review_package(config, device_info, report_path)
+
+    if args.ai_review:                       # explicit flag → headless, unattended
+        run_claude_review(pkg, console)
+    elif not args.auto:                      # interactive → let the operator choose
+        from rich.prompt import Prompt
+        console.print(
+            "\n[bold]Triage this evidence package with an AI now?[/bold]\n"
+            "  [cyan]1[/cyan]) Interactive [white]claude[/white] session  "
+            "[dim](recommended — it can ask you to connect the device / log out and verify live)[/dim]\n"
+            "  [cyan]2[/cyan]) Headless [white]claude[/white]  "
+            "[dim](streaming, unattended — writes final_report.md, no live Q&A)[/dim]\n"
+            "  [cyan]3[/cyan]) Custom / cloud command  "
+            "[dim]($TRASHDROID_REVIEW_CMD — OpenRouter / Ollama / aider)[/dim]\n"
+            "  [cyan]4[/cyan]) Just show me the prompt  [dim](paste into any AI — claude.ai, ChatGPT, …)[/dim]"
+        )
+        choice = Prompt.ask("Choice", choices=["1", "2", "3", "4"], default="1")
+        if choice == "1":
+            launch_claude_interactive(pkg, console)
+        elif choice == "2":
+            run_claude_review(pkg, console)
+        elif choice == "3":
+            if not os.environ.get("TRASHDROID_REVIEW_CMD"):
+                console.print("[yellow]$TRASHDROID_REVIEW_CMD is not set. Set it first, e.g.:[/yellow]\n"
+                              "  [white]export TRASHDROID_REVIEW_CMD='aider --message-file {prompt_file} --yes'[/white]\n"
+                              "[dim]Then re-run, or use ./run_review.sh in the package.[/dim]")
+            else:
+                run_claude_review(pkg, console)
+
+    print_next_steps(pkg, config, console)
 
     return 0
 

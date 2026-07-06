@@ -1,0 +1,718 @@
+"""
+AI-review package assembler.
+
+The Markdown report strips exactly what an AI triager needs (the screenshots and
+the raw logs). Instead, after a run we assemble a self-contained `ai_review/`
+folder that `claude` (or any agentic backend) can be pointed at directly: it
+reads the findings JSON, the human report, the raw logs, and VIEWS every
+screenshot as an image, then writes a triaged final report (VAPT tickets) —
+nothing lost.
+
+The package is built to be GREPPED and ACTED ON:
+  • findings.json — one object per (deduped) finding, each with a stable `id`
+    (F-001…), severity, detail, and an `evidence` block naming the exact
+    screenshots and log files that back it.
+  • screenshots/index.json — each PNG → caption + the finding id(s) it supports.
+  • logs/ — full, untruncated raw evidence with predictable filenames.
+
+Layout:
+  ai_review/
+  ├── PROMPT.md          triage instructions (false-positive-first) + VAPT format + steps
+  ├── CLAUDE.md          same role, auto-loaded for interactive `claude`
+  ├── findings.json      deduped findings with ids + per-finding evidence map
+  ├── report.md          the human report (evidence)
+  ├── screenshots/       *.png + index.json (png → caption / phase / finding ids)
+  ├── logs/              commands.log (full) + logcat / grep / memory / ...
+  └── run_review.sh      claude -p "$(cat PROMPT.md)" --permission-mode acceptEdits → final_report.md
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from rich.console import Console
+from rich.panel import Panel
+
+from core.report import AI_PROMPT, _dedupe_findings
+
+console = Console()
+
+_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+
+# Copy-pasteable starter prompt the operator can give Claude (or any AI) to begin the triage.
+STARTER_PROMPT = (
+    "You are triaging an Android pentest evidence package. Read PROMPT.md in this folder and follow "
+    "it exactly: triage findings.json (aggressively filter false positives), VIEW every screenshot, "
+    "then for each Likely finding offer to verify it live on the connected rooted Android device and "
+    "run the checks yourself, and write final_report.md as Android VAPT tickets with the screenshot "
+    "evidence embedded. As your FINAL step, run `python3 gen_html.py` in this folder to build "
+    "final_report.html — do NOT hand-write HTML or design CSS; the generator and its theme are fixed. "
+    "Authorized UAT engagement: record FULL secret values verbatim in the evidence — do NOT redact, "
+    "mask, or truncate them."
+)
+
+_SEV_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+
+# Raw log files we surface, and the phase each one is evidence for. Keys are the
+# destination filename in logs/; values are (path-relative-to-output_dir, phase-label).
+# The phase-label MUST match the phase strings used on config.findings / screenshots
+# so per-finding evidence maps correctly.
+_LOG_SOURCES = {
+    "grep_results.txt": ("grep_results.txt", "Phase III — Local File System Analysis"),
+    "backup_grep_results.txt": ("backup_grep_results.txt", "Phase VII — ADB Backup Analysis"),
+    "logcat_dump.txt": ("logcat_dump.txt", "Phase V — Logcat Monitoring"),
+    "logcat_app_filtered.txt": ("logcat_app_filtered.txt", "Phase V — Logcat Monitoring"),
+    "background_logcat.txt": ("background_logcat.txt", "Background Logcat"),
+    "proc_maps.txt": ("proc_maps.txt", "Phase VI — Memory Analysis"),
+    "network_connections.txt": ("network_connections.txt", "Phase VI — Memory Analysis"),
+    "open_fds.txt": ("open_fds.txt", "Phase VI — Memory Analysis"),
+}
+
+
+def assemble_review_package(config, device_info: dict, report_path) -> Path:
+    """Build the self-contained ai_review/ package: copy screenshots + logs, derive findings, and write findings.json, the screenshot index, the report copy, the triage prompt, CLAUDE.md, run_review.sh and gen_html.py; returns the (freshly recreated) package dir."""
+    pkg = config.output_dir / "ai_review"
+    if pkg.exists():
+        shutil.rmtree(pkg)
+    (pkg / "screenshots").mkdir(parents=True, exist_ok=True)
+    (pkg / "logs").mkdir(parents=True, exist_ok=True)
+
+    ss_index = _copy_screenshots(config, pkg)        # [{file, caption, phase}]
+    log_files = _assemble_logs(config, pkg)          # [{file, phase|None}]
+    findings = _build_findings(config, ss_index, log_files)
+
+    _write_findings_json(config, device_info, findings, pkg)
+    _write_screenshot_index(pkg, ss_index, findings)
+    _copy_report(report_path, pkg)
+    _write_prompt(config, device_info, findings, pkg)
+    _write_claude_md(pkg)
+    _write_runner(pkg)
+    _write_gen_html(pkg)
+    return pkg
+
+
+# ── screenshots ──────────────────────────────────────────────────
+
+def _copy_screenshots(config, pkg: Path) -> list[dict]:
+    dest = pkg / "screenshots"
+    index = []
+    for ss in config.screenshots:
+        rel = str(ss.get("path", "")).lstrip("./")
+        src = config.output_dir / rel
+        if not src.exists():
+            # Screenshot paths may be stored absolute or already package-relative.
+            alt = Path(str(ss.get("path", "")))
+            if alt.exists():
+                src = alt
+            else:
+                continue
+        try:
+            shutil.copy2(src, dest / src.name)
+            index.append({"file": src.name, "caption": ss.get("caption", ""), "phase": ss.get("phase", "")})
+        except OSError:
+            continue
+    return index
+
+
+# ── logs ─────────────────────────────────────────────────────────
+
+def _assemble_logs(config, pkg: Path) -> list[dict]:
+    logs = pkg / "logs"
+    out: list[dict] = []
+
+    # Full, untruncated command log (the .md collapses/clips this).
+    lines = []
+    for c in config.commands_log:
+        lines.append(f"### [{c.get('phase','')}] {c.get('cmd','')}")
+        if c.get("stdout"):
+            lines.append(c["stdout"])
+        if c.get("stderr"):
+            lines.append(f"[stderr] {c['stderr']}")
+        lines.append("\n" + "-" * 80 + "\n")
+    (logs / "commands.log").write_text("\n".join(lines), encoding="utf-8")
+    out.append({"file": "commands.log", "phase": None})  # general, all phases
+
+    # Raw artifact files (skip the multi-MB memory dump + pulled data tree).
+    for name, (rel, phase) in _LOG_SOURCES.items():
+        src = config.output_dir / rel
+        try:
+            if src.exists() and src.stat().st_size > 0:
+                shutil.copy2(src, logs / name)
+                out.append({"file": name, "phase": phase})
+        except OSError:
+            continue
+    return out
+
+
+# ── findings (deduped, stable ids, per-finding evidence) ─────────
+
+def _build_findings(config, ss_index: list[dict], log_files: list[dict]) -> list[dict]:
+    deduped = _dedupe_findings(config)  # {phase: [{title, severity, status, detail, occurrences}]}
+
+    flat = [(phase, f) for phase, items in deduped.items() for f in items]
+    flat.sort(key=lambda pf: (_SEV_ORDER.get(pf[1].get("severity", "Info"), 9), pf[0]))
+
+    ss_by_phase: dict[str, list[str]] = {}
+    for s in ss_index:
+        ss_by_phase.setdefault(s["phase"], []).append(s["file"])
+    logs_by_phase: dict[str, list[str]] = {}
+    general_logs = []
+    for lf in log_files:
+        if lf["phase"]:
+            logs_by_phase.setdefault(lf["phase"], []).append(lf["file"])
+        else:
+            general_logs.append(lf["file"])
+
+    findings = []
+    for i, (phase, f) in enumerate(flat, start=1):
+        findings.append({
+            "id": f"F-{i:03d}",
+            "phase": phase,
+            "title": f.get("title", ""),
+            "severity": f.get("severity", "Info"),
+            "status": f.get("status", "Open"),
+            "occurrences": f.get("occurrences", 1),
+            "detail": f.get("detail", ""),
+            "evidence": {
+                "screenshots": ss_by_phase.get(phase, []),
+                "logs": logs_by_phase.get(phase, []) + general_logs,
+            },
+        })
+    return findings
+
+
+def _write_findings_json(config, device_info: dict, findings: list[dict], pkg: Path) -> None:
+    counts = {k: 0 for k in _SEV_ORDER}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    export = {
+        "tool": "TrashDroid",
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "package": config.package_name,
+        "device": device_info,
+        "tested_logged_in": config.logged_in,
+        "total_findings": len(findings),
+        "severity_counts": counts,
+        "findings": findings,
+    }
+    (pkg / "findings.json").write_text(json.dumps(export, indent=2, default=str), encoding="utf-8")
+
+
+def _write_screenshot_index(pkg: Path, ss_index: list[dict], findings: list[dict]) -> None:
+    ids_by_phase: dict[str, list[str]] = {}
+    for f in findings:
+        ids_by_phase.setdefault(f["phase"], []).append(f["id"])
+    enriched = [{
+        "file": s["file"],
+        "caption": s["caption"],
+        "phase": s["phase"],
+        "finding_ids": ids_by_phase.get(s["phase"], []),
+    } for s in ss_index]
+    (pkg / "screenshots" / "index.json").write_text(json.dumps(enriched, indent=2), encoding="utf-8")
+
+
+# ── report.md (strip the embedded AI-prompt header) ──────────────
+
+def _copy_report(report_path, pkg: Path) -> None:
+    try:
+        text = Path(report_path).read_text(encoding="utf-8", errors="replace")
+        marker = text.find("# Android DAST Report")
+        if marker > 0:
+            text = text[marker:]
+        (pkg / "report.md").write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
+# ── PROMPT.md ────────────────────────────────────────────────────
+
+_VAPT_STANDARD = """\
+────────────────────────────────────────────────────────────────────────────
+TICKET FORMAT (use for EVERY finding in section C - match this field order exactly):
+
+    ### <n>. <Finding Title>
+    - **Status:** Open
+    - **Confidence:** Confirmed | Likely
+    - **Severity:** <Critical | High | Medium | Low>  (business-informed)
+    - **CVSS Severity:** <band from the score>
+    - **CWE / OWASP:** <root-cause CWE-...> · MASVS-... · MASTG-...
+    - **CVE:** Not Applicable | <CVE-id>
+    - **CVSS Score:** <number> <Band>
+    - **CVSS Vector:** `CVSS:3.1/AV:.../AC:.../PR:.../UI:.../S:.../C:.../I:.../A:...`   (score MUST match the vector)
+    - **Business-Informed Severity:** <may differ from the CVSS technical score; justify if so>
+    - **Severity Justification:** <why this severity; device-local vs network reach; any chaining>
+    - **Affected:** <package / file / content:// URI / exported component / SharedPreferences key - and HTTP method + Endpoint + Host if it is a network finding>
+    - **Description:** <what it is + the EXACT evidence you saw: decoded values, log lines, requests/responses>
+    - **Impact:** <technical-consequence bullets - the data/types actually exposed>
+    - **Business Impact:** <operational / reputational / financial bullets; note if root/physical access is required>
+    - **Mitigation:** <concrete, code-level actions + the expected hardened behavior>
+    - **Proof of Concept:** <numbered steps with the real values/requests, and EMBED each supporting
+          screenshot inline: ![<caption>](screenshots/<file>)>
+
+REPORTING STANDARD (authoritative - applies to every ticket; no external skill required):
+  - NEVER fabricate endpoints, payloads, tokens, roles, responses, or steps not in the evidence.
+    Preserve the tester's real values verbatim (full, unredacted - UAT scope above).
+  - CVSS: the numeric Score MUST match the CVSS:3.1 Vector exactly, and the Severity band MUST match the
+    score. A vector with C:N/I:N/A:N scores 0.0 -> Informational.
+        Bands: Critical 9.0-10.0 . High 7.0-8.9 . Medium 4.0-6.9 . Low 0.1-3.9 . Informational 0.0
+  - CVSS calibration for Android (be realistic about attack prerequisites):
+        AV:L for on-device / physical / rooted-only exploitation (most local-storage, SharedPreferences,
+        Keystore-protected, memory, ADB-backup, and file-pull findings) - this LOWERS real-world
+        severity; reflect it honestly.
+        AV:L also for cross-app IPC reachable only by a malicious co-installed app (exported components
+        without a signature/permission guard, exported content providers).
+        AV:N only for genuinely remote reach (cleartext HTTP, missing TLS pinning enabling MitM,
+        server-side/API issues, exploitable app links / deep links).
+        AC:L unless a race/uncommon precondition is needed . PR:N none / PR:L user / PR:H privileged .
+        UI:R if victim interaction needed . S:C only if exploitation crosses a trust boundary .
+        C/I/A = H/L/N strictly from demonstrated impact.
+  - CWE = the ROOT weakness, not the symptom:
+        Missing Authorization = CWE-862 . IDOR = CWE-639 . Information Disclosure = CWE-200 .
+        Insecure Storage = CWE-922 / CWE-312 . Cleartext Transmission = CWE-319 .
+        Improper Authentication = CWE-287 . Improperly Exported Component = CWE-926 .
+        SSRF = CWE-918 . SQLi = CWE-89 . XSS = CWE-79.
+        Add MASVS/MASTG ids when clearly relevant.
+  - Mitigations must be CONCRETE and code-level.
+        Good: "On logout call prefs.edit().remove(\\"refresh_token\\").commit(); store tokens in
+               EncryptedSharedPreferences backed by an Android Keystore key; confirm the value is
+               absent after logout."
+        Bad:  "Follow secure coding best practices."
+  - Claim only what the evidence demonstrates. Secure/accepted behavior, or metadata-only exposure with
+    no real data -> Informational/design-observation (Non-actionable), never an inflated severity.
+  - Voice: "Testing confirmed...", "This indicates...", "No direct security impact identified" for secure
+    behavior. Avoid hype ("attacker can now...", "complete compromise", "critical - immediate action").
+
+SELF-VALIDATION before you finish (every ticket):
+  [ ] Score matches the vector AND the band; no nonzero score with C:N/I:N/A:N.
+  [ ] CWE is the root weakness; MASVS/MASTG only where they fit.
+  [ ] Mitigation is specific (exact API/check/config), not generic.
+  [ ] Title, severity, description, impact, mitigation, PoC all describe the SAME weakness.
+  [ ] Every claim traces to evidence in this package or to what you verified live.
+
+WORKED EXAMPLE (style reference - adapt to the real finding; do not copy verbatim):
+
+    ### 1. Insecure Storage: session refresh token persists in SharedPreferences after logout
+    - **Status:** Open
+    - **Confidence:** Confirmed
+    - **Severity:** Medium
+    - **CVSS Severity:** Medium
+    - **CWE / OWASP:** CWE-922: Insecure Storage of Sensitive Information . MASVS-STORAGE-2 . MASTG-TEST-0052
+    - **CVE:** Not Applicable
+    - **CVSS Score:** 4.0 Medium
+    - **CVSS Vector:** `CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N`
+    - **Business-Informed Severity:** Medium
+    - **Severity Justification:** Recovery needs local/rooted device access (AV:L) so real-world reach
+      is limited, but the recovered item is a live refresh token, so confidentiality impact is High.
+    - **Affected:** /data/data/com.example.app/shared_prefs/auth.xml key=refresh_token
+    - **Description:** Testing confirmed the refresh token remains in SharedPreferences after logout.
+      Pulled the shared_prefs XML post-logout; the value base64-decoded to a valid JWT (exp 2026-09-01).
+    - **Impact:**
+      - A party with device access recovers a still-valid session token after the user has logged out.
+    - **Business Impact:**
+      - Session continuity for an attacker holding the device; bounded by requiring local/root access.
+    - **Mitigation:** On logout, remove the token key and store tokens in EncryptedSharedPreferences
+      backed by an Android Keystore key; confirm the value is absent post-logout.
+    - **Proof of Concept:**
+      1. Log in, background, log out.
+      2. Pull shared_prefs/auth.xml -> refresh_token still present.
+      3. base64-decode the value -> a valid, unexpired JWT.
+      ![shared_prefs after logout](screenshots/prefs_post_logout.png)
+
+If a `vapt-ticket-writer` skill is also installed you may use it, but this standard is authoritative.
+"""
+
+
+def _write_prompt(config, device_info: dict, findings: list[dict], pkg: Path) -> None:
+    counts = {k: 0 for k in _SEV_ORDER}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    counts_line = ", ".join(f"{k}: {v}" for k, v in counts.items() if v)
+
+    prompt = f"""# START HERE — Android pentest evidence triage
+
+═══ SCOPE — AUTHORIZED UAT PENTEST — RECORD FULL SECRET VALUES (DO NOT REDACT) ═══
+This is an authorized security assessment of a NON-PRODUCTION UAT build, performed by the
+application's own security team on their own enrolled test device. When you recover a secret
+(auth/session/refresh token, API key, password, decoded SharedPreferences or DB blob), write the
+COMPLETE raw value verbatim into the evidence files (logs/) and the report's Proof of Concept. Do NOT
+mask, truncate, shorten, hash, or replace it with <redacted> / <private> / "…". The full value IS the
+proof of exploitability and is required for follow-on testing (e.g. replaying the token against the
+API). Standard secret-hygiene redaction does NOT apply here; redacting defeats the purpose.
+
+{AI_PROMPT}
+
+────────────────────────────────────────────────────────────────────────
+THIS FOLDER IS A SELF-CONTAINED ANDROID PENTEST EVIDENCE PACKAGE (grep it freely).
+
+Target : {config.package_name}
+Device : {device_info.get('model','?')} | Android {device_info.get('android_version','?')} (SDK {device_info.get('sdk','?')})
+Logged in during test : {config.logged_in}
+Findings to triage : {len(findings)}  ({counts_line})
+
+FILES:
+  • findings.json     — THE WORK LIST. One object per finding, each with:
+        id (F-001…), phase, title, severity, status, occurrences, detail,
+        evidence:{{ screenshots:[…], logs:[…] }}  ← the exact files that back this finding.
+  • report.md         — human-readable report (extra context).
+  • screenshots/      — PNG evidence. **VIEW every image you need.** screenshots/index.json
+                        maps each file → caption, phase, and the finding_ids it supports.
+  • logs/             — raw evidence (read in full):
+        commands.log              every command + its full, untruncated output
+        grep_results.txt          sensitive-pattern matches pulled from the app data dir
+        logcat_dump.txt           captured device logs (Phase V)
+        background_logcat.txt     full background logcat capture over the whole run
+        backup_grep_results.txt   sensitive matches in the ADB backup (when present)
+        proc_maps.txt, network_connections.txt, open_fds.txt … (when present)
+
+HOW TO WORK (finding-by-finding):
+  1. Load findings.json. Iterate findings in severity order.
+  2. For EACH finding, open the files named in its `evidence` block:
+        - VIEW every screenshot in evidence.screenshots (they are in screenshots/).
+        - READ every file in evidence.logs (they are in logs/).
+  3. Decide the verdict (CONFIRMED / LIKELY / FALSE POSITIVE / INFORMATIONAL) per the rules above.
+  4. Cite the finding `id` and the exact screenshot filename / log line in your justification.
+  5. WRITE your output to `final_report.md` in THIS directory.
+
+FINAL REPORT — write `final_report.md`, then GENERATE the HTML from it; NOTHING redacted:
+  • `final_report.md`   — Markdown (sections A–E below); embed evidence with ![](screenshots/<file>).
+  • `final_report.html` — do NOT hand-write this and do NOT design any CSS or spend tokens on styling.
+    After final_report.md is complete, run `python3 gen_html.py` in this folder: it deterministically
+    converts final_report.md + screenshots/ into ONE self-contained HTML (every screenshot embedded as
+    a base64 data URI, a Copy button on every code/secret block, a sticky section nav, auto-filled stat
+    cards, and a filterable triage table), then self-validates and prints PASS/FAIL. The theme is fixed
+    and proven. This must be your FINAL step, after the report is done.
+
+Content of the report (final_report.md — the HTML is generated from it; NOTHING redacted):
+  A. EXECUTIVE SUMMARY (3-5 sentences): real risk posture with noise excluded — counts by real
+     severity, how many findings are Actionable vs Non-actionable, and the top real issue(s).
+
+  B. TRIAGE TABLE — EVERY finding, one row each:
+       ID | Finding | Verdict (Confirmed/Likely/False Positive/Informational) | Real Severity | Action | One-line reason
+     - Real Severity = your TRIAGED severity (Critical/High/Medium/Low/Informational), NOT the tool's raw guess.
+     - Action = "Actionable" (needs a fix) or "Non-actionable" (False Positive, or Informational note-only).
+     Omit nothing - all findings appear here.
+
+  C. FINDINGS (full write-ups) — document EVERY finding whose triaged Real Severity is
+     Critical, High, Medium, OR Low (i.e. everything EXCEPT Informational and False Positives).
+     Write a full VAPT ticket for EACH, ordered Critical -> Low, using the TICKET FORMAT in the
+     REPORTING STANDARD below, with evidence screenshots embedded inline
+     (![<caption>](screenshots/<file>), filenames from screenshots/index.json). IMAGES ARE REQUIRED
+     wherever a finding has screenshot evidence. Low-severity findings get a FULL ticket too — do NOT
+     demote them to a table row.
+
+  D. NON-ACTIONABLE ITEMS — Informational findings and False Positives ONLY, one concise line each
+     (do NOT drop them, and do NOT write full tickets for them):
+        - <id> <title> — <Verdict> — <one-line reason / short hardening note>
+
+  E. AUTOMATED LIVE VERIFICATION & DEEP-DIVE — the core of the job, not an afterthought.
+     Do NOT leave findings as "verify manually." Drive it end to end:
+       i.   Ask the operator to connect the rooted Android device over USB and confirm reachability
+            (adb devices, adb shell su -c id, frida-ps -U). If a check needs a particular app state
+            (e.g. logged OUT), ask them to set it, then continue automatically.
+       ii.  For EVERY Likely / needs-validation finding, RUN the proof with on-host tooling. Reuse the
+            framework's bridges from the repo root - this package is at <repo>/output/<pkg>/ai_review,
+            so the repo is ../../..: core.adb.ADB, core.drozer.Drozer, and core.instrumentation
+            (disable_ssl_pinning, disable_root_detection, ensure_frida_server, _frida_run) - or raw
+            adb / frida / drozer / sqlite3 / logcat / strings / base64.
+       iii. DEEP-DIVE - pull & grep the app data dir (/data/data/<pkg>), decode SharedPreferences XML
+            and SQLite blobs (sqlite3 + base64), re-fire exported activities / intents / broadcasts and
+            deep links while LOGGED OUT and screenshot, dump & grep process memory, and DECODE token /
+            secret values to prove whether they are real secrets or SDK metadata. Chain it: a leaked
+            token -> where is it used, is it still valid, what does it unlock?
+       iv.  Capture fresh EVIDENCE into screenshots/ and logs/, then embed/cite it.
+       v.   For each confirmed check, upgrade to CONFIRMED, re-derive CVSS from what you proved, and
+            REGENERATE both report files.
+     Goal: a thorough, polished report a senior pentester would sign.
+
+{_VAPT_STANDARD}
+"""
+    (pkg / "PROMPT.md").write_text(prompt, encoding="utf-8")
+
+
+def _write_claude_md(pkg: Path) -> None:
+    (pkg / "CLAUDE.md").write_text(
+        "# Android pentest evidence triage\n\n"
+        "This directory is a TrashDroid AI-review package. When the user says to begin, follow "
+        "`PROMPT.md` exactly:\n\n"
+        "**Authorized UAT pentest — record FULL secret values as evidence; do NOT redact, mask, or truncate them.**\n\n"
+        "1. Load `findings.json` (each finding has an `id` and an `evidence` block listing its "
+        "screenshots and log files).\n"
+        "2. Work finding-by-finding: VIEW every screenshot in its evidence (see "
+        "`screenshots/index.json`), READ its log files in `logs/`.\n"
+        "3. Aggressively filter false positives.\n"
+        "4. Write `final_report.md` using the operator's finding-field format (Severity / Status / "
+        "Confidence / CVSS (estimated) / CVSS Vector (estimated) / Business Impact / Description / "
+        "Proof of Concept / Remediation), and EMBED supporting screenshots inline with "
+        "`![caption](screenshots/<file>)`. Then build `final_report.html` by running `python3 gen_html.py` in this folder — do NOT hand-write HTML or design CSS; it deterministically converts final_report.md + screenshots/ into one self-contained, self-validating HTML with the fixed theme. Run it as your final step.\n"
+        "5. DRIVE automated live verification (the core of the job): ask the operator to connect the "
+        "rooted Android device, then for EVERY Likely / needs-validation finding run the proof yourself "
+        "— reuse the TrashDroid bridges at the repo root `../../..` (core.adb.ADB, core.drozer.Drozer, "
+        "core.instrumentation) or raw adb/frida/drozer/sqlite3/logcat/base64. Deep-dive (decode "
+        "SharedPreferences & DB blobs, re-fire exported components / deep links LOGGED-OUT + screenshot, "
+        "grep process memory), save fresh evidence into `screenshots/` and `logs/`, then upgrade "
+        "confirmed findings and regenerate a polished `final_report.md` with the real PoC embedded.\n\n"
+        "Reports document EVERY finding rated Low or above as a full VAPT ticket (Informational + false positives are listed one concise line each), using the VAPT reporting standard embedded in PROMPT.md — no external skill required.\n",
+        encoding="utf-8",
+    )
+
+
+def _write_gen_html(pkg: Path) -> None:
+    """Copy the deterministic HTML generator into the package.
+
+    The AI just runs `python3 gen_html.py` to turn final_report.md + screenshots/ into a
+    self-contained final_report.html — fixed theme, ~0 tokens on design, built-in self-check.
+    Source of truth: core/templates/gen_html.py.
+    """
+    dst = pkg / "gen_html.py"
+    shutil.copy2(_TEMPLATE_DIR / "gen_html.py", dst)
+    try:
+        os.chmod(dst, 0o755)
+    except OSError:
+        pass
+
+
+def _write_runner(pkg: Path) -> None:
+    script = pkg / "run_review.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "# Run Claude over this evidence package to produce final_report.md.\n"
+        "set -euo pipefail\n"
+        'cd "$(dirname "$0")"\n'
+        'if [ -n "${TRASHDROID_REVIEW_CMD:-}" ]; then\n'
+        '  echo "Running custom review command: $TRASHDROID_REVIEW_CMD"\n'
+        '  _cmd="${TRASHDROID_REVIEW_CMD//\\{prompt_file\\}/PROMPT.md}"\n'
+        '  if [[ "$TRASHDROID_REVIEW_CMD" == *"{prompt_file}"* ]]; then\n'
+        '    sh -c "$_cmd"\n'
+        '  else\n'
+        '    sh -c "$_cmd \\"$(cat PROMPT.md)\\""\n'
+        '  fi\n'
+        'else\n'
+        '  command -v claude >/dev/null 2>&1 || { echo "claude not on PATH (or set TRASHDROID_REVIEW_CMD)"; exit 1; }\n'
+        '  echo "Running Claude over the review package (reads logs + views all screenshots; a few minutes)..."\n'
+        '  claude -p "$(cat PROMPT.md)" --permission-mode acceptEdits --output-format text\n'
+        'fi\n'
+        'if [ -f final_report.md ]; then\n'
+        '  python3 gen_html.py || echo "gen_html.py exited non-zero — see its summary above."\n'
+        'fi\n'
+        'echo\n'
+        'echo "Done. Reports: $(pwd)/final_report.md + final_report.html"\n',
+        encoding="utf-8",
+    )
+    try:
+        os.chmod(script, 0o755)
+    except OSError:
+        pass
+
+
+# ── optional auto-run (--ai-review) ──────────────────────────────
+
+def run_claude_review(pkg: Path, console: Console, timeout_s: int = 1800) -> None:
+    """Run an AI over the package to write final_report.md, with LIVE progress.
+
+    Provider-agnostic: if $TRASHDROID_REVIEW_CMD is set, that command runs instead
+    of the bundled `claude` CLI, so you can point the review at any agentic backend
+    (e.g. aider on OpenRouter, an Ollama wrapper, a local script). Placeholders:
+    {prompt_file} -> path to PROMPT.md, {prompt} -> its inlined text; if neither is
+    present the PROMPT.md path is appended as the final argument.
+    """
+    prompt_path = pkg / "PROMPT.md"
+    custom = os.environ.get("TRASHDROID_REVIEW_CMD")
+    if custom:
+        import shlex
+        if "{prompt_file}" in custom:
+            cmd = shlex.split(custom.replace("{prompt_file}", str(prompt_path)))
+        elif "{prompt}" in custom:
+            cmd = shlex.split(custom.replace("{prompt}", prompt_path.read_text(encoding="utf-8")))
+        else:
+            cmd = shlex.split(custom) + [str(prompt_path)]
+        console.print(f"[cyan]Running custom review command ($TRASHDROID_REVIEW_CMD):[/cyan] [white]{custom}[/white]")
+        try:
+            subprocess.run(cmd, cwd=str(pkg), timeout=timeout_s)
+        except FileNotFoundError:
+            console.print(f"[yellow]Command not found: {cmd[0]!r}. Check $TRASHDROID_REVIEW_CMD.[/yellow]")
+        except subprocess.TimeoutExpired:
+            console.print(f"[yellow]Review command timed out ({timeout_s // 60} min).[/yellow]")
+        _announce_final(pkg, console)
+        return
+
+    if not shutil.which("claude"):
+        console.print("[yellow]`claude` CLI not found on PATH — skipping auto-review.\n"
+                      f"  Run it yourself:  cd '{pkg}' && ./run_review.sh\n"
+                      "  Or any backend:   set $TRASHDROID_REVIEW_CMD, or paste PROMPT.md into a cloud model "
+                      "(see 'Next steps' below).[/yellow]")
+        return
+
+    _run_claude_streaming(pkg, prompt_path.read_text(encoding="utf-8"), console, timeout_s)
+    _announce_final(pkg, console)
+
+
+def _announce_final(pkg: Path, console: Console) -> None:
+    final = pkg / "final_report.md"
+    if final.exists():
+        console.print(f"[green]✓ Final triaged report: {final}[/green]")
+        _generate_html(pkg, console)
+    else:
+        console.print(f"[yellow]Finished, but final_report.md was not written — check the output above. "
+                      f"Package: {pkg}[/yellow]")
+
+
+def _generate_html(pkg: Path, console: Console) -> None:
+    """Deterministically build final_report.html from final_report.md via the bundled
+    gen_html.py — no AI tokens on HTML. It self-validates and prints PASS/FAIL; a non-zero
+    exit (e.g. a missing screenshot) is surfaced but never aborts the run."""
+    script = pkg / "gen_html.py"
+    if not script.exists():
+        return
+    try:
+        r = subprocess.run([sys.executable, str(script)], cwd=str(pkg),
+                           capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        console.print(f"[yellow]Could not run gen_html.py ({e}); final_report.html not generated.[/yellow]")
+        return
+    if r.stdout:
+        console.print(r.stdout.rstrip())
+    html = pkg / "final_report.html"
+    if html.exists() and r.returncode == 0:
+        console.print(f"[green]✓ HTML report: {html}[/green]")
+    elif html.exists():
+        console.print(f"[yellow]HTML report written WITH WARNINGS (see summary above): {html}[/yellow]")
+    else:
+        console.print("[yellow]final_report.html was not produced — see gen_html.py output above.[/yellow]")
+
+
+def _tool_summary(inp: dict) -> str:
+    for k in ("file_path", "path", "pattern", "command", "url", "description"):
+        v = inp.get(k)
+        if isinstance(v, str) and v:
+            return (v[:70] + "…") if len(v) > 70 else v
+    return ""
+
+
+def _run_claude_streaming(pkg: Path, prompt: str, console: Console, timeout_s: int) -> None:
+    """Run `claude` headless with stream-json so the operator SEES live activity —
+    every tool the model runs, files it touches, and a final cost/duration line —
+    instead of a silent terminal until the very end."""
+    cmd = ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
+           "--output-format", "stream-json", "--verbose"]
+    console.print("[cyan]Starting AI review — live activity below (runs for several minutes).[/cyan]")
+    console.print("[dim]  A second Claude session is now working in this folder; leave it running.[/dim]\n")
+    start = time.time()
+
+    def _el() -> str:
+        s = int(time.time() - start)
+        return f"{s // 60}m{s % 60:02d}s"
+
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(pkg), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except FileNotFoundError:
+        console.print("[yellow]`claude` could not be launched.[/yellow]")
+        return
+
+    n_tools = 0
+    try:
+        for line in proc.stdout:
+            if time.time() - start > timeout_s:
+                proc.kill()
+                console.print(f"[yellow]Review exceeded {timeout_s // 60} min — stopped. Re-run ./run_review.sh.[/yellow]")
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            typ = ev.get("type")
+            if typ == "assistant":
+                for b in ev.get("message", {}).get("content", []):
+                    if b.get("type") == "tool_use":
+                        n_tools += 1
+                        console.print(f"  [dim]{_el()}[/dim] [cyan]●[/cyan] {b.get('name', 'tool')} "
+                                      f"[dim]{_tool_summary(b.get('input', {}))}[/dim]")
+                    elif b.get("type") == "text":
+                        txt = " ".join(b.get("text", "").split())
+                        if txt:
+                            console.print(f"  [dim]{_el()}[/dim] [white]{txt[:140]}[/white]")
+            elif typ == "result":
+                dur = ev.get("duration_ms", 0) // 1000
+                cost = ev.get("total_cost_usd")
+                tail = f", ${cost:.3f}" if isinstance(cost, (int, float)) else ""
+                console.print(f"\n  [green]✔ review finished[/green] [dim]({dur}s, {n_tools} tool calls{tail})[/dim]")
+        proc.wait(timeout=10)
+    except KeyboardInterrupt:
+        proc.kill()
+        console.print("[yellow]Interrupted — partial work left in the package.[/yellow]")
+    except Exception as e:
+        console.print(f"[yellow]Review stream ended: {e}[/yellow]")
+
+
+def launch_claude_interactive(pkg: Path, console: Console) -> None:
+    """Hand the terminal to an INTERACTIVE claude session in the package, seeded
+    with the starter prompt. Unlike the headless path this can ask the operator
+    questions mid-review ("connect the device", "log the app out", "shall I verify
+    this finding live?") and run the on-device verification with the operator in the
+    loop — the whole point of the live-verification step. The tool stays alive while
+    the session runs (device access stays up), and resumes when the operator exits.
+    """
+    if not shutil.which("claude"):
+        console.print("[yellow]`claude` CLI not found on PATH. Start a session yourself:\n"
+                      f"  cd '{pkg}' && claude[/yellow]")
+        return
+    console.print("[cyan]Launching an interactive Claude session in the evidence package…[/cyan]")
+    console.print("[dim]  It can ask you to connect the device / log the app out and verify findings live.\n"
+                  "  Keep the device plugged in. Type /exit (or Ctrl-D) when the report is done.[/dim]\n")
+    try:
+        # Positional prompt → interactive REPL seeded with it; acceptEdits so report/evidence
+        # writes don't prompt, while device/bash actions still ask (operator stays in control).
+        subprocess.run(["claude", STARTER_PROMPT, "--permission-mode", "acceptEdits"], cwd=str(pkg))
+    except FileNotFoundError:
+        console.print("[yellow]`claude` could not be launched.[/yellow]")
+    except KeyboardInterrupt:
+        pass
+    _announce_final(pkg, console)
+
+
+def print_next_steps(pkg: Path, config, console: Console) -> None:
+    """End-of-run guidance: where the output is, the prompt to give the AI, and how to proceed."""
+    final = pkg / "final_report.md"
+    lines = [
+        f"[bold]Operator:[/bold]      {os.environ.get('USER', '?')}",
+        f"[bold]Target:[/bold]        {config.package_name}",
+        f"[bold]Output dir:[/bold]    {config.output_dir.resolve()}",
+        f"[bold]AI-review pkg:[/bold] {pkg.resolve()}",
+    ]
+    if final.exists():
+        lines.append(f"[green]Final report already written:[/green] {final.resolve()}")
+    lines += [
+        "",
+        "[bold]1) Hand the package to an AI to triage — pick a backend:[/bold]",
+        "   • [bold]Claude Code[/bold] (best — reads the screenshots, can verify on-device):",
+        f"       [white]cd '{pkg}' && claude[/white]   [dim]then say: follow PROMPT.md[/dim]",
+        f"       [white]cd '{pkg}' && ./run_review.sh[/white]   [dim]headless → final_report.md + .html[/dim]",
+        "   • [bold]Any other agentic backend[/bold] (OpenRouter / Ollama / aider / custom CLI):",
+        "       [white]export TRASHDROID_REVIEW_CMD='aider --message-file {prompt_file} --yes'[/white]",
+        "       [dim]then ./run_review.sh (or re-run with --ai-review). {prompt_file}=PROMPT.md path, {prompt}=inlined text.[/dim]",
+        "   • [bold]A plain cloud chat[/bold] (claude.ai / ChatGPT / OpenRouter web): paste [white]PROMPT.md[/white] + "
+        "[white]report.md[/white].",
+        "       [dim]Caveat: a non-agentic chat can triage the text but can't VIEW the screenshots or run the live "
+        "on-device checks — use an agentic CLI above for the full job.[/dim]",
+        "",
+        "[bold]2) Prompt to give the AI:[/bold]",
+        f"   [italic]{STARTER_PROMPT}[/italic]",
+        "",
+        "[bold]3) Then:[/bold] review [white]final_report.md[/white]. For every 'Likely' finding the AI will "
+        "verify it live on the connected rooted Android device (decode SharedPreferences/DB values, "
+        "re-fire exported components / deep links logged-out, grep memory) and regenerate the report "
+        "with a confirmed PoC + evidence.",
+        "[dim]   The shareable [white]final_report.html[/white] (every screenshot embedded, copy buttons, "
+        "filterable triage) is built automatically from final_report.md by the bundled gen_html.py.[/dim]",
+    ]
+    console.print(Panel("\n".join(lines), title="Next steps — AI triage", style="cyan", expand=False))
