@@ -42,6 +42,53 @@ def select_device() -> str:
         console.print("[red]Invalid selection, try again.[/red]")
 
 
+def _select_installed_package(adb: ADB) -> str:
+    """Interactive target-package picker.
+
+    Lists installed third-party packages as a numbered menu (mirroring
+    `select_device`) and lets the user pick a number or type/paste any package id
+    (e.g. a system package not in the list). Verifies the chosen package is
+    actually installed so a typo can't run the whole assessment against nothing.
+    """
+    try:
+        packages = adb.list_installed_packages(third_party_only=True)
+    except ADBError:
+        packages = []
+
+    if packages:
+        console.print("\n[bold cyan]Installed third-party packages:[/bold cyan]")
+        for i, pkg in enumerate(packages, 1):
+            console.print(f"  [{i}] {pkg}")
+        console.print("[dim]Pick a number, or type/paste a package name "
+                      "(e.g. a system package not shown above).[/dim]")
+    else:
+        console.print("[yellow]Could not list installed packages — enter the package name manually.[/yellow]")
+
+    while True:
+        choice = Prompt.ask("Select target package (number or name)").strip()
+
+        if choice.isdigit() and packages:
+            idx = int(choice) - 1
+            if 0 <= idx < len(packages):
+                return packages[idx]
+            console.print("[red]Number out of range, try again.[/red]")
+            continue
+
+        if not _validate_package_name(choice):
+            console.print("[red]Invalid package name format. Expected: com.example.app[/red]")
+            continue
+
+        try:
+            installed = adb.is_package_installed(choice)
+        except ADBError:
+            installed = True  # device query failed — don't block on it
+        if not installed and not Confirm.ask(
+            f"'{choice}' does not appear to be installed. Use it anyway?", default=False
+        ):
+            continue
+        return choice
+
+
 def get_apk_input(adb: ADB) -> tuple[str | None, str, bool]:
     """
     Returns (apk_path or None, package_name, is_preinstalled).
@@ -50,12 +97,7 @@ def get_apk_input(adb: ADB) -> tuple[str | None, str, bool]:
     preinstalled = Confirm.ask("Is the app already installed on the device?", default=False)
 
     if preinstalled:
-        pkg = Prompt.ask("Enter the package name (adb shell pm list packages)")
-        pkg = pkg.strip()
-        while not _validate_package_name(pkg):
-            console.print("[red]Invalid package name format. Expected: com.example.app[/red]")
-            pkg = Prompt.ask("Enter a valid package name").strip()
-        return None, pkg, True
+        return None, _select_installed_package(adb), True
 
     apk_path = Prompt.ask("Enter the full path to the APK file")
     apk_path = apk_path.strip().strip("'\"")

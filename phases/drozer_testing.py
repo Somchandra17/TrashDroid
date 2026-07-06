@@ -9,14 +9,14 @@ Supports filtering out false-positive library components (androidx.*, google.gms
 from __future__ import annotations
 
 from rich.console import Console
-from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 
 from core.adb import ADB
-from core.config import DROZER_AGENT_PKG, DROZER_PORT, Config
+from core.config import Config
 from core.drozer import Drozer
 from core.screenshot import ScreenshotManager
+from phases.drozer_common import ensure_drozer_connected
 from utils.helpers import is_library_component, is_valid_package_name
 
 console = Console()
@@ -44,63 +44,6 @@ def _print_filtered_table(title: str, to_test: list[str], skipped: list[str], co
     console.print(table)
 
 
-MAX_DROZER_RETRIES = 3
-
-
-def _ensure_drozer_connected(config: Config, adb: ADB, drozer: Drozer) -> bool:
-    """
-    Set up port forwarding, verify the drozer connection.
-    If it fails, launch the Drozer Agent app on the device, ask the user
-    to enable the embedded server, and retry up to MAX_DROZER_RETRIES times.
-    Returns True if connected, False if all retries exhausted.
-    """
-    import time
-
-    console.print("[cyan]Setting up Drozer port forwarding...[/cyan]")
-    drozer.setup_port_forward()
-    config.log_command(PHASE, f"adb forward tcp:{DROZER_PORT} tcp:{DROZER_PORT}", "Port forwarded")
-
-    console.print("[cyan]Verifying Drozer connection...[/cyan]")
-    if drozer.verify_connection():
-        console.print("[green]Drozer connected successfully.[/green]")
-        return True
-
-    # Connection failed — launch the agent and guide the user
-    for attempt in range(1, MAX_DROZER_RETRIES + 1):
-        console.print(f"\n[red bold]Drozer connection failed (attempt {attempt}/{MAX_DROZER_RETRIES}).[/red bold]")
-        console.print("[cyan]Launching Drozer Agent on the device...[/cyan]")
-        adb.shell(f"monkey -p {DROZER_AGENT_PKG} -c android.intent.category.LAUNCHER 1")
-        time.sleep(2)
-
-        console.print(Panel(
-            "The Drozer Agent app has been opened on your device.\n\n"
-            "Tap the toggle/button to ENABLE the Embedded Server.\n\n"
-            "Press Enter here once the server is ON.",
-            style="bold yellow",
-        ))
-
-        if config.auto_mode:
-            console.print("[yellow]Auto-mode: waiting 5 seconds for agent to start...[/yellow]")
-            time.sleep(5)
-        else:
-            input()
-
-        drozer.setup_port_forward()
-        if drozer.verify_connection():
-            console.print("[green]Drozer connected successfully.[/green]")
-            return True
-
-    console.print("\n[red bold]Could not connect to Drozer after all retries. Skipping Drozer phase.[/red bold]")
-    config.add_finding(
-        PHASE,
-        "Drozer connection failed after retries",
-        "Info",
-        "Could not connect to the Drozer agent after multiple attempts. "
-        "Ensure the agent APK (com.withsecure.dz) is installed and the embedded server is enabled.",
-    )
-    return False
-
-
 def run_drozer_testing(config: Config, adb: ADB, drozer: Drozer, screenshotter: ScreenshotManager) -> None:
     """Phase I — test exported components via drozer and capture screenshots.
 
@@ -116,7 +59,7 @@ def run_drozer_testing(config: Config, adb: ADB, drozer: Drozer, screenshotter: 
         return
 
     # ── Verify drozer connection (with auto-launch + retry) ──
-    if not _ensure_drozer_connected(config, adb, drozer):
+    if not ensure_drozer_connected(config, adb, drozer, PHASE):
         return
 
     # ── Attack surface overview ──
@@ -586,7 +529,14 @@ def _test_intents(config: Config, drozer: Drozer, ss: ScreenshotManager, pkg: st
     result = drozer.get_browsable_activities(pkg)
     config.log_command(PHASE, f"run scanner.activity.browsable -a {pkg}", result.stdout, result.stderr)
 
-    if result.stdout:
+    # Only treat output as a finding when the module actually ran and returned
+    # real data. A failed/unreachable module yields blanked stdout (see
+    # Drozer._run_module_once), and an empty success just means the app has no
+    # browsable activities — neither is a finding.
+    if not result.success:
+        console.print("[yellow]  scanner.activity.browsable did not complete "
+                      "(agent error or timeout) — skipping.[/yellow]")
+    elif result.stdout.strip():
         console.print(f"[dim]{result.stdout}[/dim]")
         config.add_finding(
             PHASE,
@@ -594,6 +544,8 @@ def _test_intents(config: Config, drozer: Drozer, ss: ScreenshotManager, pkg: st
             "Medium",
             f"The following browsable activities/intents were discovered:\n{result.stdout[:2000]}",
         )
+    else:
+        console.print("[green]  No browsable activities exposed.[/green]")
 
     launch_result = drozer.run_module("app.package.launchintent", pkg)
     config.log_command(PHASE, f"run app.package.launchintent {pkg}", launch_result.stdout, launch_result.stderr)

@@ -41,7 +41,9 @@ from phases.manifest import run_manifest_analysis
 from phases.memory import run_memory_analysis
 from phases.post_logout import run_post_logout_testing
 from phases.preflight import run_preflight
+from phases.runtime_hardening import run_runtime_hardening
 from phases.setup import get_apk_input, install_and_prepare, select_device
+from utils.helpers import is_valid_package_name
 
 console = Console()
 
@@ -54,6 +56,7 @@ ALL_PHASES = {
     7: ("Phase VII — ADB Backup Analysis", "backup"),
     8: ("Phase VIII— Manifest Analysis", "manifest"),
     9: ("Phase IX  — Post-Logout Access Control", "post_logout"),
+    10: ("Phase X   — Runtime Hardening (SSL pinning / root detection)", "runtime_hardening"),
 }
 
 _EXAMPLES = """\
@@ -120,8 +123,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--screenshot-delay",
         type=float,
-        default=4.5,
-        help="Delay in seconds before capturing a screenshot (default: 4.5)",
+        default=TIMING.screenshot_settle_delay,
+        help=f"Delay in seconds before capturing a screenshot (default: {TIMING.screenshot_settle_delay})",
     )
     parser.add_argument(
         "--presidio",
@@ -223,7 +226,11 @@ def main() -> int:
         f"SDK {device_info['sdk']}[/green]"
     )
 
-    root_status = adb.is_rooted()
+    try:
+        root_status = adb.is_rooted()
+    except Exception as e:
+        console.print(f"[yellow]⚠ Could not determine root status ({e}); assuming not rooted.[/yellow]")
+        root_status = False
     if root_status:
         console.print("[green]✓ Device is rooted.[/green]")
     else:
@@ -234,14 +241,37 @@ def main() -> int:
     if not verify_device_prerequisites(adb):
         return 1
 
-    # ── APK input ──
+    # ── Target app input ──
     if args.package:
+        if not is_valid_package_name(args.package):
+            console.print(f"[red]Invalid --package '{args.package}'. Expected e.g. com.example.app[/red]")
+            return 1
         config.package_name = args.package
         config.apk_path = args.apk or None
         config.is_preinstalled = not bool(args.apk)
         if config.apk_path and not Path(config.apk_path).exists():
             console.print(f"[red]APK file not found: {config.apk_path}[/red]")
             return 1
+    elif args.apk:
+        # --apk without --package: derive the package id from the APK rather than
+        # silently ignoring --apk and re-prompting.
+        if not Path(args.apk).exists():
+            console.print(f"[red]APK file not found: {args.apk}[/red]")
+            return 1
+        derived = adb.get_package_name_from_apk(args.apk)
+        if not derived or not is_valid_package_name(derived):
+            console.print(
+                f"[red]Could not determine a valid package name from {args.apk}. "
+                f"Pass --package explicitly.[/red]"
+            )
+            return 1
+        config.package_name = derived
+        config.apk_path = args.apk
+        config.is_preinstalled = False
+        console.print(f"[green]Derived package from APK: {derived}[/green]")
+    elif args.auto:
+        console.print("[red]--auto requires --package or --apk (cannot prompt interactively).[/red]")
+        return 1
     else:
         apk_path, pkg, is_pre = get_apk_input(adb)
         config.apk_path = apk_path
@@ -271,7 +301,7 @@ def main() -> int:
     install_and_prepare(adb, config)
 
     # ── Init helpers ──
-    drozer = Drozer(device_id)
+    drozer = Drozer(device_id, rooted=root_status)
     screenshotter = ScreenshotManager(adb, config.screenshot_dir, config)
 
     # ── Register cleanup handler (prevents orphan logcat/scrcpy + saves partial report) ──
@@ -344,6 +374,7 @@ def main() -> int:
         7: lambda: run_backup_analysis(config, adb),
         8: lambda: run_manifest_analysis(config, adb),
         9: lambda: run_post_logout_testing(config, adb, drozer, screenshotter),
+        10: lambda: run_runtime_hardening(config, adb, screenshotter),
     }
 
     for phase_num in sorted(selected):

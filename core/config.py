@@ -112,8 +112,19 @@ LIMITS = Limits()
 
 # ── On-device agent / tooling locations (shared across phases) ──
 # drozer agent package + launchable activity (WithSecure agent app).
+# NOTE: the WithSecure agent keeps a capital-W Java namespace (com.WithSecure.dz)
+# even though the package id is lowercase (com.withsecure.dz), so the fully
+# qualified activity is required — a relative "/.activities.MainActivity" would
+# resolve to the wrong (nonexistent) class and `am start` would fail.
 DROZER_AGENT_PKG = "com.withsecure.dz"
-DROZER_AGENT_ACTIVITY = "com.withsecure.dz/.activities.MainActivity"
+DROZER_AGENT_ACTIVITY = "com.withsecure.dz/com.WithSecure.dz.activities.MainActivity"
+# Broadcast action the agent's StartServiceReceiver listens for to start its
+# embedded server without the UI toggle (only takes effect once the server is
+# enabled — see localServerEnabled in the agent prefs).
+DROZER_AGENT_START_ACTION = "com.withsecure.dz.PWN"
+# Agent SharedPreferences file + the boolean that persists "embedded server on".
+DROZER_AGENT_PREFS = "/data/data/com.withsecure.dz/shared_prefs/com.withsecure.dz_preferences.xml"
+DROZER_AGENT_SERVER_PREF = "localServerEnabled"
 # TCP port drozer forwards between host and on-device agent.
 DROZER_PORT = 31415
 # Default on-device frida-server path.
@@ -137,7 +148,7 @@ class Config:
     auto_mode: bool = False
     report_mode: str = "client"  # client | internal
 
-    screenshot_delay: float = 4.5
+    screenshot_delay: float = TIMING.screenshot_settle_delay
 
     # Presidio PII detection engine (None when not enabled)
     presidio_engine: object = None

@@ -22,6 +22,7 @@ from rich.panel import Panel
 
 from core.adb import ADB, ADBError
 from core.config import FRIDA_SERVER_PATH, LIMITS, SENSITIVE_PATTERNS, Config
+from core.instrumentation import ensure_frida_server, frida_available
 from utils.helpers import is_valid_package_name, presidio_findings_to_report, presidio_scan_text
 
 console = Console()
@@ -145,48 +146,14 @@ rpc.exports = {
 """
 
 
-def _frida_available() -> bool:
-    try:
-        import frida  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _ensure_frida_server(adb: ADB) -> bool:
-    """Make sure frida-server is running on the device. Returns True if ready."""
-    ps_out = adb.shell("ps -A", root=True).stdout
-    if "frida-server" in ps_out:
-        return True
-
-    console.print("  [cyan]frida-server not running. Attempting to start...[/cyan]")
-    exists = adb.shell(f"ls {FRIDA_SERVER_PATH}", root=True)
-    if "No such file" in exists.stdout or exists.returncode != 0:
-        console.print(f"  [yellow]frida-server binary not found at {FRIDA_SERVER_PATH}.[/yellow]")
-        console.print("  [yellow]To install: download the matching frida-server from[/yellow]")
-        console.print("  [yellow]  https://github.com/frida/frida/releases[/yellow]")
-        console.print(f"  [yellow]  then: adb push frida-server {FRIDA_SERVER_PATH}[/yellow]")
-        return False
-
-    adb.shell(f"chmod 755 {FRIDA_SERVER_PATH}", root=True)
-    adb.shell(f"{FRIDA_SERVER_PATH} -D &", root=True)
-    time.sleep(2)
-
-    ps_out = adb.shell("ps -A", root=True).stdout
-    if "frida-server" in ps_out:
-        console.print("  [green]frida-server started.[/green]")
-        return True
-
-    console.print("  [yellow]frida-server failed to start.[/yellow]")
-    return False
-
-
 def _frida_dump(config: Config, adb: ADB, pkg: str, pid: str, local_path: str) -> bool:
-    if not _frida_available():
+    # Frida availability + on-device server management are shared with Phase X;
+    # they live in core.instrumentation so both phases stay in sync.
+    if not frida_available():
         console.print("  [dim]Frida not installed (pip install frida frida-tools). Skipping.[/dim]")
         return False
 
-    if not _ensure_frida_server(adb):
+    if not ensure_frida_server(adb):
         return False
 
     console.print("  [cyan]Dumping memory via Frida...[/cyan]")

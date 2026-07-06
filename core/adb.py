@@ -87,7 +87,12 @@ class ADB:
 
     @staticmethod
     def get_devices() -> list[str]:
-        result = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10)
+        # Callable before preflight (e.g. with --skip-preflight), so a missing or
+        # wedged adb must degrade to "no devices" instead of an uncaught exception.
+        try:
+            result = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return []
         lines = result.stdout.strip().splitlines()[1:]
         devices = []
         for line in lines:
@@ -138,8 +143,30 @@ class ADB:
 
     def is_package_installed(self, package: str) -> bool:
         _require_package(package)
+        # `pm list packages <pkg>` filters by substring, so match the exact
+        # `package:<pkg>` line — otherwise a prefix of a real package (e.g.
+        # "com.example" vs "com.example.app") would report as installed.
         result = self.shell(f"pm list packages {package}")
-        return f"package:{package}" in result.stdout
+        target = f"package:{package}"
+        return any(line.strip() == target for line in result.stdout.splitlines())
+
+    def list_installed_packages(self, third_party_only: bool = True) -> list[str]:
+        """Return installed package ids (third-party only by default), sorted.
+
+        Used by the interactive target-app picker. Labels are intentionally not
+        resolved — Android has no cheap per-app label lookup without pulling each
+        APK and running aapt, and reverse-DNS ids are self-descriptive.
+        """
+        flag = " -3" if third_party_only else ""
+        result = self.shell(f"pm list packages{flag}")
+        pkgs = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("package:"):
+                pkg = line[len("package:"):].strip()
+                if pkg:
+                    pkgs.append(pkg)
+        return sorted(set(pkgs))
 
     def get_pid(self, package: str) -> Optional[str]:
         _require_package(package)
@@ -162,6 +189,14 @@ class ADB:
         """
         import uuid
         _require_device_path(remote)
+
+        # Many apps don't have every standard subdir (e.g. no app_webview/ when
+        # the app never uses a WebView). Skip cleanly rather than emitting a
+        # misleading "root copy failed" from a cp against a nonexistent path.
+        exists = self.shell(f"ls -d {remote}", root=True)
+        if exists.returncode != 0:
+            return ""
+
         staging = f"/data/local/tmp/dast_stage_{uuid.uuid4().hex[:8]}"
         try:
             self.shell(f"mkdir -p {staging}", root=True)
@@ -180,7 +215,22 @@ class ADB:
     def launch_app(self, package: str) -> str:
         _require_package(package)
         result = self.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
-        return result.stdout.strip()
+        out = result.stdout
+        if result.returncode == 0 and "No activities found" not in out and "** Error" not in out:
+            return out.strip()
+
+        # Fallback: monkey found no launchable activity (or errored) — resolve the
+        # launcher component and start it directly via `am start`.
+        resolved = self.shell(f"cmd package resolve-activity --brief {package}")
+        for line in resolved.stdout.splitlines():
+            line = line.strip()
+            if line.startswith(f"{package}/"):
+                activity = line.split("/", 1)[1]
+                if is_valid_component_name(activity):
+                    alt = self.shell(f"am start -n {line}")
+                    return alt.stdout.strip() or out.strip()
+                break
+        return out.strip()
 
     def clear_app_data(self, package: str) -> str:
         _require_package(package)

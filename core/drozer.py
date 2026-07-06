@@ -10,7 +10,13 @@ from dataclasses import dataclass
 
 from rich.console import Console
 
-from core.config import DROZER_PORT
+from core.config import (
+    DROZER_AGENT_PKG,
+    DROZER_AGENT_PREFS,
+    DROZER_AGENT_SERVER_PREF,
+    DROZER_AGENT_START_ACTION,
+    DROZER_PORT,
+)
 
 console = Console()
 
@@ -31,6 +37,26 @@ _MODULE_ERROR_PATTERNS = re.compile(
     r"security exception|not found|failed to)",
     re.IGNORECASE,
 )
+
+# Transport/connection failures raised by drozer/pysolar when the on-device
+# agent's embedded server is unreachable or wedged. pysolar's ConnectionError
+# literally print()s the "yayerroryay ... valid drozer server" banner to stdout
+# (see pysolar/api/transport/exceptions.py), so this noise lands in captured
+# output and must NOT be mistaken for real module results. Detecting it lets us
+# (a) blank the bogus "output" and (b) trigger an automatic agent restart.
+_CONNECTION_ERROR_PATTERNS = re.compile(
+    r"(valid drozer server|yayerroryay|connectionerror|"
+    r"connection refused|connection reset|broken pipe|"
+    r"no route to host|could not connect|unable to connect|"
+    r"has no attribute 'message')",
+    re.IGNORECASE,
+)
+
+# How many times a single Drozer instance will auto-restart the agent server to
+# recover from a mid-run connection loss before giving up (avoids thrashing).
+MAX_AUTO_RECONNECTS = 3
+# Polls (× ~2s) to wait for the embedded server to come up after a restart.
+SERVER_START_POLLS = 15
 
 
 def _strip_drozer_noise(output: str) -> str:
@@ -85,9 +111,31 @@ class DrozerResult:
 class Drozer:
     """Non-interactive drozer wrapper using `drozer console connect -c`."""
 
-    def __init__(self, device_id: str = ""):
+    def __init__(self, device_id: str = "", rooted: bool = False):
         self.device_id = device_id
+        self.rooted = rooted
         self._connected = False
+        # Auto-recovery bookkeeping: cap agent restarts per instance so a
+        # persistently dead agent can't turn every module into a 30s restart.
+        self._reconnects = 0
+
+    def _adb(self, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess | None:
+        """Run an adb subcommand against this device; None on timeout/missing adb."""
+        cmd = ["adb"]
+        if self.device_id:
+            cmd += ["-s", self.device_id]
+        cmd += args
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+
+    def _adb_shell(self, cmd: str, root: bool = False, timeout: int = 30) -> subprocess.CompletedProcess | None:
+        # For root commands we pass a single `su -c "<cmd>"` string so the device
+        # shell (not adb's arg splitter) parses it — this keeps quoting in `cmd`
+        # intact instead of `su` swallowing only the first token.
+        shell_arg = f'su -c "{cmd}"' if root else cmd
+        return self._adb(["shell", shell_arg], timeout=timeout)
 
     def setup_port_forward(self) -> bool:
         cmd = ["adb"]
@@ -96,6 +144,44 @@ class Drozer:
         cmd += ["forward", f"tcp:{DROZER_PORT}", f"tcp:{DROZER_PORT}"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return result.returncode == 0
+
+    def _enable_local_server_pref(self) -> None:
+        """On rooted devices, flip the agent's persisted embedded-server flag to
+        true so the server auto-starts when the agent is launched. No-op without
+        root (the setting can then only be toggled from the agent UI)."""
+        if not self.rooted:
+            return
+        # `/localServerEnabled/s/false/true/` avoids embedding double quotes, so
+        # it survives the su -c "..." wrapper without extra escaping.
+        self._adb_shell(
+            f"sed -i '/{DROZER_AGENT_SERVER_PREF}/s/false/true/' {DROZER_AGENT_PREFS}",
+            root=True,
+        )
+
+    def restart_agent_server(self) -> bool:
+        """Force a clean start of the on-device agent's embedded server and wait
+        for it to become reachable. Returns True if drozer can connect afterward.
+
+        Rooted devices are deterministic (persist the flag, relaunch, poll).
+        Without root we can still relaunch + fire the start broadcast, but the
+        server only comes up if it was already enabled in the agent."""
+        import time
+
+        self._enable_local_server_pref()
+        self._adb_shell(f"am force-stop {DROZER_AGENT_PKG}")
+        time.sleep(1)
+        # Launch by package (version-independent) rather than a hard-coded class.
+        self._adb_shell(f"monkey -p {DROZER_AGENT_PKG} -c android.intent.category.LAUNCHER 1")
+        time.sleep(1)
+        # Nudge the StartServiceReceiver in case the app doesn't auto-start it.
+        self._adb_shell(f"am broadcast -a {DROZER_AGENT_START_ACTION}")
+
+        for _ in range(SERVER_START_POLLS):
+            self.setup_port_forward()
+            if self.verify_connection():
+                return True
+            time.sleep(2)
+        return False
 
     def verify_connection(self) -> bool:
         """Test that drozer console can connect to the agent on the device."""
@@ -112,7 +198,38 @@ class Drozer:
         self._connected = False
         return False
 
+    @staticmethod
+    def is_connection_failure(result: DrozerResult) -> bool:
+        """True when a result reflects a dead/wedged agent (transport error or
+        timeout) rather than a module that ran and produced/omitted output."""
+        blob = f"{result.raw_stdout} {result.stderr}"
+        if _CONNECTION_ERROR_PATTERNS.search(blob):
+            return True
+        return result.stderr.startswith("Timed out after")
+
     def run_module(self, module: str, args: str = "", timeout: int = 30) -> DrozerResult:
+        """Run a drozer module, transparently recovering from a lost agent.
+
+        If the underlying call reports a connection failure (the agent's embedded
+        server died or wedged mid-run — a common drozer failure mode), restart
+        the agent server once and retry, capped at MAX_AUTO_RECONNECTS per run."""
+        result = self._run_module_once(module, args, timeout)
+
+        if self.is_connection_failure(result) and self._reconnects < MAX_AUTO_RECONNECTS:
+            self._reconnects += 1
+            console.print(
+                f"  [yellow]Drozer agent unreachable — restarting its embedded server "
+                f"(auto-recover {self._reconnects}/{MAX_AUTO_RECONNECTS})...[/yellow]"
+            )
+            if self.restart_agent_server():
+                console.print("  [green]Drozer agent recovered.[/green]")
+                result = self._run_module_once(module, args, timeout)
+            else:
+                console.print("  [red]Drozer agent restart failed.[/red]")
+
+        return result
+
+    def _run_module_once(self, module: str, args: str = "", timeout: int = 30) -> DrozerResult:
         # The command string is parsed by the drozer console; reject control
         # characters (newline/CR/NUL) and malformed module names so a crafted
         # value can't inject additional drozer console commands.
@@ -134,11 +251,26 @@ class Drozer:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             raw_stdout = result.stdout.strip()
             raw_stderr = result.stderr.strip()
+            combined = f"{raw_stdout} {raw_stderr}"
+
+            # A transport failure is not module output — the captured stdout is
+            # drozer/pysolar error noise. Blank it so no caller mistakes the
+            # "yayerroryay ... valid drozer server" banner for real findings.
+            if _CONNECTION_ERROR_PATTERNS.search(combined):
+                return DrozerResult(
+                    module=module,
+                    args=args,
+                    stdout="",
+                    stderr=raw_stderr or "drozer connection error (agent unreachable)",
+                    success=False,
+                    raw_stdout=raw_stdout,
+                )
+
             clean_stdout = _strip_drozer_noise(raw_stdout)
 
             # Determine real success: exit code 0 AND no module-level errors in output
             module_ok = result.returncode == 0
-            has_error = bool(_MODULE_ERROR_PATTERNS.search(raw_stdout + " " + raw_stderr))
+            has_error = bool(_MODULE_ERROR_PATTERNS.search(combined))
             real_success = module_ok and not has_error
 
             return DrozerResult(

@@ -16,9 +16,10 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from core.adb import ADB, ADBError
-from core.config import DROZER_AGENT_ACTIVITY, Config
+from core.config import Config
 from core.drozer import Drozer
 from core.screenshot import ScreenshotManager
+from phases.drozer_common import ensure_drozer_connected
 from utils.helpers import is_library_component, is_valid_package_name
 
 console = Console()
@@ -77,7 +78,7 @@ def run_post_logout_testing(config: Config, adb: ADB, drozer: Drozer, screenshot
         adb.force_stop(pkg)
 
     # ── Verify drozer connection for post-logout tests ──
-    drozer_ok = _ensure_drozer_for_post_logout(config, adb, drozer)
+    drozer_ok = ensure_drozer_connected(config, adb, drozer, PHASE)
     if drozer_ok:
         console.print("\n[cyan]Re-testing exported activities post-logout...[/cyan]")
         _retest_activities_drozer(config, adb, drozer, screenshotter, pkg)
@@ -88,35 +89,6 @@ def run_post_logout_testing(config: Config, adb: ADB, drozer: Drozer, screenshot
     _test_direct_activity_access(config, adb, screenshotter, pkg)
 
     console.print(f"\n[green]✓ {PHASE} complete.[/green]")
-
-
-def _ensure_drozer_for_post_logout(config: Config, adb: ADB, drozer: Drozer) -> bool:
-    """Try to connect drozer; if it fails, launch agent and prompt user."""
-    console.print("[cyan]Verifying Drozer connection...[/cyan]")
-    drozer.setup_port_forward()
-    if drozer.verify_connection():
-        console.print("[green]Drozer connected.[/green]")
-        return True
-
-    console.print("[yellow]Drozer connection failed. Launching Drozer Agent...[/yellow]")
-    adb.shell(f"am start -n {DROZER_AGENT_ACTIVITY}")
-    time.sleep(2)
-
-    if not config.auto_mode:
-        console.print(Panel(
-            "Drozer Agent opened on device.\nEnable the Embedded Server, then press Enter.",
-            style="bold yellow",
-        ))
-        input()
-    else:
-        time.sleep(5)
-
-    drozer.setup_port_forward()
-    if drozer.verify_connection():
-        console.print("[green]Drozer connected.[/green]")
-        return True
-
-    return False
 
 
 def _retest_activities_drozer(

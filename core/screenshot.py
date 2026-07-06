@@ -13,6 +13,8 @@ from typing import Optional
 
 from rich.console import Console
 
+from core.config import TIMING
+
 console = Console()
 
 
@@ -64,7 +66,7 @@ class ScreenshotManager:
         Returns the local file path or None on failure.
         """
         if delay is None:
-            delay = self.config.screenshot_delay if self.config else 4.5
+            delay = self.config.screenshot_delay if self.config else TIMING.screenshot_settle_delay
         time.sleep(delay)
         self._counter += 1
         ts = datetime.now().strftime("%H%M%S")
